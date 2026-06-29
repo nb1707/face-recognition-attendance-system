@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Live Camera Detection</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h2>Live Camera Detection</h2>
+        <p class="subtitle">
+            AI-based face recognition system for school presence monitoring and attendance suggestion.
+        </p>
+
+        <div class="section">
+            <h3>Camera Configuration</h3>
+
+            <label>Camera Source:</label><br>
+            <select id="cameraId" onchange="updateCameraInfo()">
+                <option value="cam_gate_01">Gate Camera - School Entrance</option>
+                <option value="cam_hallway_a_02">Hallway Camera - Hallway A Floor 2</option>
+            </select>
+        </div>
+
+        <h3>Dashboard Summary</h3>
+
+        <div class="dashboard">
+            <div class="dashboard-card">
+                <h4>Registered Users</h4>
+                <p id="registeredUsersCount">0</p>
+            </div>
+
+            <div class="dashboard-card">
+                <h4>Today Present</h4>
+                <p id="todayPresentCount">0</p>
+            </div>
+
+            <div class="dashboard-card">
+                <h4>Unknown Detections</h4>
+                <p id="unknownDetectionsCount">0</p>
+            </div>
+        </div>
+
+        <button onclick="loadDashboardSummary()">Refresh Dashboard</button><br><br>
+        
+        <div id="cameraInfo" class="camera-info">
+            Camera ID: cam_gate_01<br>
+            Location: School Entrance<br>
+            Type: gate
+        </div>
+
+        <div class="camera-wrapper">
+            <video id="attendanceVideo" width="420" height="320" autoplay></video>
+            <canvas id="overlayCanvas" width="420" height="320"></canvas>
+        </div>
+
+        <canvas id="attendanceCanvas" width="420" height="320" style="display:none;"></canvas>
+
+        <br><br>
+
+        <button onclick="startAttendanceCamera()">Start Camera</button>
+        <button onclick="startRecognitionLoop()">Start Recognition</button>
+        <button onclick="stopRecognitionLoop()">Stop Recognition</button>
+        <button onclick="window.location.href='/app'">Back to Registration</button>
+        <button onclick="window.location.href='/video-analysis-page'">
+            Go to Video Analysis
+        </button>
+        <p id="attendanceStatus"></p>
+
+        <h3>Detection  Logs</h3>
+        <button onclick="loadAttendanceLogs()">Refresh Logs</button>
+        <ul id="attendanceLogs"></ul>
+
+        <button onclick="window.location.href='/attendance-logs/export'">
+            Export Attendance CSV
+        </button>
+
+        <button onclick="clearAttendanceLogs()">Clear Attendance Logs</button>
+
+        <button onclick="clearUnknownFaces()">Clear Unknown Faces</button>
+
+        <h3>Attendance Candidates</h3>
+
+        <button onclick="loadAttendanceCandidates()">Refresh Candidates</button>
+
+        <button onclick="clearAttendanceCandidates()">
+            Clear Attendance Candidates
+        </button>
+
+        <ul id="attendanceCandidatesList"></ul>
+
+        <h3>Unknown Faces</h3>
+        <button onclick="loadUnknownFaces()">Refresh Unknown Faces</button>
+        <ul id="unknownFacesList"></ul>
+
+        <button onclick="checkCloudHealth()">Check Cloud Health</button>
+
+        <pre id="cloudHealthResult"></pre>
+
+    </div>
+
+    <script src="/static/attendance.js"></script>
+</body>
+</html>

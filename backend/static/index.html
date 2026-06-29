@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Face Registration</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h2>Face Registration App</h2>
+
+        <label>User ID:</label><br>
+        <input id="userId" value="student_001"><br><br>
+
+        <label>Full Name:</label><br>
+        <input id="fullName" value="Nhan Bui"><br><br>
+
+        <label>Role:</label><br>
+        <select id="role">
+            <option value="student">Student</option>
+            <option value="teacher">Teacher</option>
+            <option value="staff">Staff</option>
+        </select><br><br>
+
+        <h3 id="instruction">Step 1: Please look straight at the camera</h3>
+        <div class="camera-wrapper">
+            <video id="video" width="420" height="320" autoplay></video>
+            <div class="face-guide"></div>
+            <div id="countdown" class="countdown-overlay"></div>
+            <div id="guideMessage" class="guide-message">
+                Align your face inside the frame
+            </div>
+        </div>
+
+        <canvas id="canvas" width="420" height="320" style="display:none;"></canvas>
+
+        <br><br>
+
+        <button onclick="startCamera()">Start Camera</button>
+        <button id="captureBtn" onclick="captureAndUpload()">Capture Current Step</button>
+        <button id="autoScanBtn" onclick="startAutoScan()">Start Auto Scan</button>
+        <button onclick="resetRegistration()">Register New User</button>
+        <button onclick="window.location.href='/users-page'">View Registered Users</button>
+        <button onclick="window.location.href='/attendance-page'">Go to Attendance</button>
+        <p id="status"></p>
+
+        <h3>Registration Progress</h3>
+        <ul>
+            <li id="frontStatus">Front: ⬜ Not captured</li>
+            <li id="leftStatus">Left: ⬜ Not captured</li>
+            <li id="rightStatus">Right: ⬜ Not captured</li>
+        </ul>
+        <h3>Registered Users</h3>
+        <button onclick="loadUsers()">Refresh Users</button>
+        <ul id="usersList"></ul>
+    </div>
+    <script src="/static/app.js"></script>
+
+</body>
+
+
+</html>

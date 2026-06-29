@@ -1,0 +1,212 @@
+body {
+    font-family: Arial, sans-serif;
+    background: #f4f6f8;
+    text-align: center;
+    padding: 30px;
+}
+
+.container {
+    background: white;
+    max-width: 650px;
+    margin: auto;
+    padding: 25px;
+    border-radius: 16px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+}
+
+input,
+select,
+button {
+    padding: 10px;
+    margin: 6px;
+    width: 250px;
+    border-radius: 8px;
+    border: 1px solid #ccc;
+}
+
+button {
+    cursor: pointer;
+    background: #2563eb;
+    color: white;
+    border: none;
+}
+
+button:disabled {
+    background: gray;
+    cursor: not-allowed;
+}
+
+video {
+    border-radius: 14px;
+    border: 3px solid #2563eb;
+    /* margin-top: 15px; */
+}
+
+#countdown {
+    font-size: 48px;
+    color: #2563eb;
+}
+
+#status {
+    font-weight: bold;
+    color: #111827;
+}
+
+ul {
+    list-style: none;
+    padding: 0;
+}
+
+li {
+    margin: 8px;
+    font-size: 18px;
+}
+.camera-wrapper {
+    position: relative;
+    display: inline-block;
+    margin-top: 15px;
+    overflow: hidden;
+    border-radius: 14px;
+}
+
+.face-guide {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+
+    width: 180px;
+    height: 240px;
+
+    transform: translate(-50%, -50%);
+
+    border: 4px solid rgba(255,255,255,0.9);
+    border-radius: 50%;
+
+    box-shadow: 0 0 15px rgba(255,255,255,0.5);
+
+    pointer-events: none;
+}
+
+.guide-message {
+    position: absolute;
+    bottom: 15px;
+    left: 50%;
+
+    transform: translateX(-50%);
+
+    background: rgba(0,0,0,0.6);
+    color: white;
+
+    padding: 8px 14px;
+    border-radius: 10px;
+
+    font-size: 14px;
+}
+
+.camera-wrapper video {
+    width: 420px;
+    height: 320px;
+    object-fit: cover;
+    display: block;
+}
+
+.countdown-overlay {
+    position: absolute;
+    inset: 0;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    font-size: 72px;
+    font-weight: bold;
+    color: white;
+
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: 14px;
+
+    pointer-events: none;
+}
+
+#overlayCanvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 420px;
+    height: 320px;
+    pointer-events: none;
+}
+
+/* Dashboard Styles */
+.dashboard {
+    display: flex;
+    justify-content: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin: 20px 0;
+}
+
+.dashboard-card {
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+    padding: 12px;
+    width: 160px;
+}
+
+.dashboard-card h4 {
+    margin: 0;
+    font-size: 14px;
+    color: #374151;
+}
+
+.dashboard-card p {
+    margin: 10px 0 0;
+    font-size: 28px;
+    font-weight: bold;
+    color: #2563eb;
+}
+
+.subtitle {
+    color: #6b7280;
+    font-size: 14px;
+    margin-top: -8px;
+    margin-bottom: 20px;
+}
+
+.section {
+    background: #f9fafb;
+    padding: 16px;
+    margin: 18px 0;
+    border-radius: 14px;
+    border: 1px solid #e5e7eb;
+}
+
+#attendanceStatus {
+    background: #eef2ff;
+    padding: 12px;
+    border-radius: 10px;
+    color: #1e3a8a;
+    font-weight: bold;
+}
+
+#attendanceLogs li,
+#unknownFacesList li,
+#attendanceCandidatesList li {
+    background: #f3f4f6;
+    margin: 8px 0;
+    padding: 10px;
+    border-radius: 10px;
+    text-align: left;
+    font-size: 14px;
+}
+
+.camera-info {
+    margin-top: 12px;
+    padding: 10px;
+    background: #eef2ff;
+    border: 1px solid #c7d2fe;
+    border-radius: 10px;
+    color: #1e3a8a;
+    font-size: 14px;
+}

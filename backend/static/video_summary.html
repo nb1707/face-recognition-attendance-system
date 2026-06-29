@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Attendance Summary</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+
+<div class="container">
+
+    <h2>Video Attendance Summary</h2>
+
+    <div class="dashboard">
+
+        <div class="dashboard-card">
+            <h4>Total Students</h4>
+            <p id="totalStudents">0</p>
+        </div>
+
+        <div class="dashboard-card">
+            <h4>Present</h4>
+            <p id="presentStudents">0</p>
+        </div>
+
+        <div class="dashboard-card">
+            <h4>Absent</h4>
+            <p id="absentStudents">0</p>
+        </div>
+
+    </div>
+
+    <div class="section">
+
+        <label>Select Session</label>
+
+        <select id="sessionSelect"></select>
+
+        <button onclick="loadSelectedSession()">
+            Load Session
+        </button>
+
+    </div>
+
+    <h3 id="sessionTitle"></h3>
+
+    <table class="summary-table">
+
+        <thead>
+            <tr>
+                <th>User ID</th>
+                <th>Name</th>
+                <th>Detected</th>
+                <th>Total</th>
+                <th>Presence %</th>
+                <th>Status</th>
+            </tr>
+        </thead>
+
+        <tbody id="summaryTableBody"></tbody>
+
+    </table>
+
+    <br>
+    <button onclick="viewEvidence()">
+        View Evidence Frames
+    </button>
+    <button onclick="window.location.href='/video-analysis-page'">
+        Back To Video Analysis
+    </button>
+
+</div>
+
+<script src="/static/video_summary.js"></script>
+
+</body>
+</html>

@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Video Analysis</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+    <div class="container">
+        <h2>Classroom Video Analysis</h2>
+        <p class="subtitle">
+            Upload a classroom video to process face recognition and generate attendance evidence.
+        </p>
+
+        <div class="section">
+            <h3>Video Session Information</h3>
+
+            <label>Session ID:</label><br>
+            <input id="sessionId" value="cam_01"><br><br>
+
+            <label>Class Name:</label><br>
+            <input id="className" value="lab"><br><br>
+
+            <label>Camera Source:</label><br>
+            <select id="cameraId" onchange="updateVideoCameraInfo()">
+                <option value="front_cam_01">Front Camera - Full Classroom View</option>
+                <option value="side_cam_02">Side Camera - Side Angle View</option>
+            </select>
+
+            <div id="videoCameraInfo" class="camera-info">
+                Camera ID: front_cam_01<br>
+                Location: front cam<br>
+                Purpose: Capture full classroom view
+            </div>
+        </div>
+
+        <div class="section">
+            <h3>Upload Video</h3>
+
+            <input type="file" id="videoFile" accept="video/*"><br><br>
+
+            <label>Sample Interval Seconds:</label><br>
+            <input id="sampleInterval" type="number" value="5"><br><br>
+
+            <button onclick="processVideo()">Process Video</button>
+        </div>
+
+        <div class="section">
+            <h3>Processing Result</h3>
+            <p id="videoStatus">No video processed yet.</p>
+
+            <pre id="videoResult"></pre>
+
+            <button onclick="goToSummary()">View Summary</button>
+            <button onclick="window.location.href='/app'">Back to Registration</button>
+            <button onclick="window.location.href='/attendance-page'">Back to Live Detection</button>
+        </div>
+    </div>
+
+    <script src="/static/video_analysis.js"></script>
+</body>
+</html>
