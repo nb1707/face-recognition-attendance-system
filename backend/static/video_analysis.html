@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="UTF-8">
     <title>Video Analysis</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -8,23 +9,34 @@
 <body>
     <div class="container">
         <h2>Classroom Video Analysis</h2>
+
         <p class="subtitle">
             Upload a classroom video to process face recognition and generate attendance evidence.
+            The session ID will be generated automatically by the backend.
         </p>
 
         <div class="section">
             <h3>Video Session Information</h3>
 
-            <label>Session ID:</label><br>
-            <input id="sessionId" value="cam_01"><br><br>
+            <label for="className">Class Name:</label><br>
+            <input
+                id="className"
+                type="text"
+                value="lab"
+                placeholder="Enter class name"
+            ><br><br>
 
-            <label>Class Name:</label><br>
-            <input id="className" value="lab"><br><br>
-
-            <label>Camera Source:</label><br>
-            <select id="cameraId" onchange="updateVideoCameraInfo()">
-                <option value="front_cam_01">Front Camera - Full Classroom View</option>
-                <option value="side_cam_02">Side Camera - Side Angle View</option>
+            <label for="cameraId">Camera Source:</label><br>
+            <select
+                id="cameraId"
+                onchange="updateVideoCameraInfo()"
+            >
+                <option value="front_cam_01">
+                    Front Camera - Full Classroom View
+                </option>
+                <option value="side_cam_02">
+                    Side Camera - Side Angle View
+                </option>
             </select>
 
             <div id="videoCameraInfo" class="camera-info">
@@ -35,25 +47,83 @@
         </div>
 
         <div class="section">
+            <h3>Processing Configuration</h3>
+
+            <label for="detectionMode">Detection Mode:</label><br>
+            <select id="detectionMode">
+                <option value="full">Full Frame</option>
+                <option value="roi">ROI</option>
+                <option value="tiled" selected>
+                    ROI + Tiled Detection
+                </option>
+            </select><br><br>
+
+            <label for="sampleInterval">
+                Sample Interval Seconds:
+            </label><br>
+            <input
+                id="sampleInterval"
+                type="number"
+                min="0.1"
+                step="0.1"
+                value="5"
+            ><br><br>
+        </div>
+
+        <div class="section">
             <h3>Upload Video</h3>
 
-            <input type="file" id="videoFile" accept="video/*"><br><br>
+            <input
+                type="file"
+                id="videoFile"
+                accept="video/mp4,video/avi,video/quicktime,video/x-matroska"
+            ><br><br>
 
-            <label>Sample Interval Seconds:</label><br>
-            <input id="sampleInterval" type="number" value="5"><br><br>
-
-            <button onclick="processVideo()">Process Video</button>
+            <button
+                id="processVideoButton"
+                type="button"
+                onclick="processVideo()"
+            >
+                Process Video
+            </button>
         </div>
 
         <div class="section">
             <h3>Processing Result</h3>
-            <p id="videoStatus">No video processed yet.</p>
+
+            <p id="videoStatus">
+                No video processed yet.
+            </p>
+
+            <div id="generatedSessionContainer" hidden>
+                <strong>Generated Session ID:</strong>
+                <span id="generatedSessionId"></span>
+            </div>
 
             <pre id="videoResult"></pre>
 
-            <button onclick="goToSummary()">View Summary</button>
-            <button onclick="window.location.href='/app'">Back to Registration</button>
-            <button onclick="window.location.href='/attendance-page'">Back to Live Detection</button>
+            <button
+                id="viewSummaryButton"
+                type="button"
+                onclick="goToSummary()"
+                disabled
+            >
+                View Summary
+            </button>
+
+            <button
+                type="button"
+                onclick="window.location.href='/app'"
+            >
+                Back to Registration
+            </button>
+
+            <button
+                type="button"
+                onclick="window.location.href='/attendance-page'"
+            >
+                Back to Live Detection
+            </button>
         </div>
     </div>
 

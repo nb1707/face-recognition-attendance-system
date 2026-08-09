@@ -6,16 +6,227 @@ import numpy as np
 import os
 from insightface.app import FaceAnalysis
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+import threading
+from urllib.parse import quote
 import json
 from datetime import datetime
 import shutil
-from fastapi.responses import FileResponse
 import csv
 from io import BytesIO
+from recognition.model_factory import get_model
+import time
+import uuid
+# to run API benchmark, import the following functions from evaluation.benchmark
+from uuid import uuid4
+from pydantic import BaseModel
+from recognition.face_detector import get_shared_detector
+from recognition.face_preprocessing import align_detected_face
+
+from evaluation.benchmark import run_model_benchmark
+
+from recognition.detection_config import (CLASSROOM_ROI, TILED_DETECTION_CONFIG, DEFAULT_CLASSROOM_DETECTION_MODE)
 
 # load environment variables from .env file
 load_dotenv()
+
+HIKVISION_HOST = os.getenv(
+    "HIKVISION_HOST",
+    ""
+)
+
+HIKVISION_RTSP_PORT = int(
+    os.getenv(
+        "HIKVISION_RTSP_PORT",
+        "554"
+    )
+)
+
+HIKVISION_USERNAME = os.getenv(
+    "HIKVISION_USERNAME",
+    ""
+)
+
+HIKVISION_PASSWORD = os.getenv(
+    "HIKVISION_PASSWORD",
+    ""
+)
+
+HIKVISION_CHANNEL = int(
+    os.getenv(
+        "HIKVISION_CHANNEL",
+        "1"
+    )
+)
+
+HIKVISION_STREAM_TYPE = int(
+    os.getenv(
+        "HIKVISION_STREAM_TYPE",
+        "1"
+    )
+)
+
+HIKVISION_CAMERA_ID = os.getenv(
+    "HIKVISION_CAMERA_ID",
+    "hikvision_camera_01"
+)
+
+HIKVISION_CAMERA_LOCATION = os.getenv(
+    "HIKVISION_CAMERA_LOCATION",
+    "Unknown"
+)
+
+HIKVISION_CAMERA_TYPE = os.getenv(
+    "HIKVISION_CAMERA_TYPE",
+    "hikvision_rtsp"
+)
+
+RTSP_RECOGNITION_INTERVAL_SECONDS = float(
+    os.getenv(
+        "RTSP_RECOGNITION_INTERVAL_SECONDS",
+        "1.0"
+    )
+)
+# Function to get the RTSP URL for Hikvision camera
+def build_hikvision_rtsp_url() -> str:
+    if not HIKVISION_HOST:
+        raise ValueError(
+            "HIKVISION_HOST is missing from .env"
+        )
+
+    if not HIKVISION_USERNAME:
+        raise ValueError(
+            "HIKVISION_USERNAME is missing from .env"
+        )
+
+    if not HIKVISION_PASSWORD:
+        raise ValueError(
+            "HIKVISION_PASSWORD is missing from .env"
+        )
+
+    if HIKVISION_STREAM_TYPE not in {
+        1,2,3
+    }:
+        raise ValueError(
+            "HIKVISION_STREAM_TYPE must be 1, 2, or 3"
+        )
+
+    encoded_username = quote(
+        HIKVISION_USERNAME,
+        safe=""
+    )
+
+    encoded_password = quote(
+        HIKVISION_PASSWORD,
+        safe=""
+    )
+
+    channel_id = (
+        HIKVISION_CHANNEL * 100
+        + HIKVISION_STREAM_TYPE
+    )
+
+    return (
+        f"rtsp://"
+        f"{encoded_username}:"
+        f"{encoded_password}@"
+        f"{HIKVISION_HOST}:"
+        f"{HIKVISION_RTSP_PORT}"
+        f"/Streaming/Channels/"
+        f"{channel_id}"
+    )
+
+# Draw bounding box for live camera recognition
+def draw_live_camera_results(
+    frame: np.ndarray,
+    results: list[dict]
+) -> np.ndarray:
+    annotated_frame = frame.copy()
+
+    for face in results:
+        bbox = face.get("bbox")
+
+        if not bbox:
+            continue
+
+        x1 = int(bbox["x1"])
+        y1 = int(bbox["y1"])
+        x2 = int(bbox["x2"])
+        y2 = int(bbox["y2"])
+
+        confidence = float(
+            face.get(
+                "confidence",
+                0
+            )
+        )
+
+        if face.get("recognized"):
+            # OpenCV default font may not render
+            # Vietnamese names correctly, so use user_id.
+            user_id = face.get(
+                "user_id",
+                "recognized"
+            )
+
+            label = (
+                f"{user_id} "
+                f"{confidence:.2f}"
+            )
+
+            color = (
+                0,
+                255,
+                0
+            )
+
+        else:
+            label = (
+                f"Unknown "
+                f"{confidence:.2f}"
+            )
+
+            color = (
+                0,
+                0,
+                255
+            )
+
+        cv2.rectangle(
+            annotated_frame,
+            (x1, y1),
+            (x2, y2),
+            color,
+            2
+        )
+
+        cv2.putText(
+            annotated_frame,
+            label,
+            (
+                x1,
+                max(
+                    y1 - 10,
+                    25
+                )
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            color,
+            2
+        )
+
+    cv2.putText(
+        annotated_frame,
+        "HIKVISION RTSP - LIVE",
+        (20, 35),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 255),
+        2
+    )
+
+    return annotated_frame
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -44,13 +255,1001 @@ ATTENDANCE_CANDIDATE_FILE = "storage/attendance_candidates.json"
 
 RECOGNITION_THRESHOLD = 0.45
 
+
 BLUR_THRESHOLD = 50
 MIN_BRIGHTNESS = 40
 MAX_BRIGHTNESS = 220
 
 ATTENDANCE_COOLDOWN_SECONDS = 60
-face_app = FaceAnalysis(name="buffalo_l")
-face_app.prepare(ctx_id=-1)  # CPU mode
+# face_app = FaceAnalysis(name="buffalo_l")
+# face_app.prepare(ctx_id=-1)  # CPU mode
+ACTIVE_MODEL_NAME = "buffalo_l" 
+shared_detector = get_shared_detector()
+SUPPORTED_DETECTION_MODES = {
+    "full",
+    "roi",
+    "tiled"
+}
+
+
+def detect_faces_by_mode(
+    img,
+    detection_mode: str = "full"
+):
+    normalized_mode = (
+        detection_mode
+        .strip()
+        .lower()
+    )
+
+    if normalized_mode not in SUPPORTED_DETECTION_MODES:
+        raise ValueError(
+            "Unsupported detection mode: "
+            f"{detection_mode}"
+        )
+
+    if normalized_mode == "full":
+        return shared_detector.detect_faces(
+            img
+        )
+
+    if normalized_mode == "roi":
+        return shared_detector.detect_faces_in_roi(
+            image=img,
+            roi_config=CLASSROOM_ROI
+        )
+
+    return shared_detector.detect_faces_tiled(
+        image=img,
+        roi_config=CLASSROOM_ROI,
+        tile_count=(
+            TILED_DETECTION_CONFIG[
+                "tile_count"
+            ]
+        ),
+        overlap_ratio=(
+            TILED_DETECTION_CONFIG[
+                "overlap_ratio"
+            ]
+        ),
+        nms_iou_threshold=(
+            TILED_DETECTION_CONFIG[
+                "nms_iou_threshold"
+            ]
+        )
+    )
+
+MODEL_THRESHOLDS = {
+    "buffalo_l": 0.45,
+    "facenet": 0.65,
+    "adaface": 0.40,
+    "arcface_r100":0.45
+}
+SUPPORTED_BENCHMARK_MODELS = [
+    "buffalo_l",
+    "facenet",
+    "adaface",
+    "arcface_r100"
+]
+# helper
+def get_model_threshold(model_name: str) -> float:
+    normalized_name = model_name.strip().lower()
+
+    if normalized_name not in MODEL_THRESHOLDS:
+        raise ValueError(
+            f"Recognition threshold is not configured for model: {model_name}"
+        )
+
+    return MODEL_THRESHOLDS[normalized_name]
+
+class BenchmarkRequest(BaseModel):
+    model: str
+    dataset_root: str = "evaluation_dataset"
+#Use Pydantic request model helping FastAPI to validate JSON body and auto create schema in Swagger 
+
+
+
+# Helper save records
+def insert_evaluation_records(
+    records: list[dict],
+    run_id: str,
+    model_name: str,
+    threshold: float
+):
+    rows = []
+
+    for record in records:
+        rows.append({
+            "run_id": run_id,
+            "model_name": model_name,
+            "image_name": record["image_name"],
+            "image_path": record["image_path"],
+            "expected_user_id": (
+                record["expected_user_id"]
+            ),
+            "predicted_user_id": (
+                record["predicted_user_id"]
+            ),
+            "confidence": record["confidence"],
+            "threshold": threshold,
+            "is_correct": record["is_correct"],
+            "processing_time_ms": (
+                record["processing_time_ms"]
+            ),
+            "error_message": (
+                record.get("error_message")
+            )
+        })
+
+    batch_size = 200
+
+    for start in range(0, len(rows), batch_size):
+        batch = rows[
+            start:start + batch_size
+        ]
+
+        supabase.table(
+            "evaluation_results"
+        ).insert(batch).execute()
+
+# API
+@app.post("/run-benchmark")
+def run_benchmark_api(
+    request: BenchmarkRequest
+):
+    model_name = request.model.strip().lower()
+
+    supported_models = set(SUPPORTED_BENCHMARK_MODELS)
+
+    if model_name not in supported_models:
+        return {
+            "success": False,
+            "message": (
+                f"Unsupported model: {model_name}"
+            )
+        }
+
+    threshold = get_model_threshold(
+        model_name
+    )
+
+    run_id = str(uuid4())
+
+    supabase.table(
+        "evaluation_runs"
+    ).insert({
+        "run_id": run_id,
+        "model_name": model_name,
+        "dataset_name": request.dataset_root,
+        "threshold": threshold,
+        "status": "running"
+    }).execute()
+
+    try:
+        cached_users = load_users()
+
+        cached_embeddings = (
+            load_cloud_mean_embeddings(
+                model_name
+            )
+        )
+
+        benchmark_result = run_model_benchmark(
+            model_name=model_name,
+            dataset_root=request.dataset_root,
+            recognition_function=(
+                recognize_faces_with_model
+            ),
+            cached_users=cached_users,
+            cached_embeddings=cached_embeddings
+        )
+
+        records = benchmark_result["records"]
+        metrics = benchmark_result["metrics"]
+
+        insert_evaluation_records(
+            records=records,
+            run_id=run_id,
+            model_name=model_name,
+            threshold=threshold
+        )
+
+        supabase.table(
+            "evaluation_runs"
+        ).update({
+            "total_images": (
+                metrics["total_images"]
+            ),
+            "correct_predictions": (
+                metrics["correct_predictions"]
+            ),
+            "accuracy": metrics["accuracy"],
+            "precision": metrics["precision"],
+            "recall": metrics["recall"],
+            "f1_score": metrics["f1_score"],
+            "false_accept_rate": (
+                metrics["false_accept_rate"]
+            ),
+            "false_reject_rate": (
+                metrics["false_reject_rate"]
+            ),
+            "wrong_identity_rate": (
+                metrics["wrong_identity_rate"]
+            ),
+            "known_identity_accuracy": (
+                metrics[
+                    "known_identity_accuracy"
+                ]
+            ),
+            "average_processing_time_ms": (
+                metrics[
+                    "average_processing_time_ms"
+                ]
+            ),
+            "confusion_matrix": {
+                "labels": metrics["labels"],
+                "matrix": (
+                    metrics["confusion_matrix"]
+                )
+            },
+            "classification_report": (
+                metrics[
+                    "classification_report"
+                ]
+            ),
+            "status": "completed",
+            "completed_at": (
+                datetime.now().isoformat()
+            )
+        }).eq(
+            "run_id",
+            run_id
+        ).execute()
+
+        return {
+            "success": True,
+            "run_id": run_id,
+            "model_name": model_name,
+            "metrics": metrics
+        }
+
+    except Exception as error:
+        supabase.table(
+            "evaluation_runs"
+        ).update({
+            "status": "failed",
+            "completed_at": (
+                datetime.now().isoformat()
+            )
+        }).eq(
+            "run_id",
+            run_id
+        ).execute()
+
+        return {
+            "success": False,
+            "run_id": run_id,
+            "model_name": model_name,
+            "message": str(error)
+        }
+    
+class RunAllBenchmarksRequest(BaseModel):
+    dataset_root: str = "evaluation_dataset"
+
+@app.post("/run-all-benchmarks")
+def run_all_benchmarks(
+    request: RunAllBenchmarksRequest
+):
+    results = []
+
+    for model_name in SUPPORTED_BENCHMARK_MODELS:
+        benchmark_request = BenchmarkRequest(
+            model=model_name,
+            dataset_root=request.dataset_root
+        )
+
+        result = run_benchmark_api(
+            benchmark_request
+        )
+
+        results.append(result)
+
+    successful_runs = [
+        result
+        for result in results
+        if result.get("success", False)
+    ]
+
+    failed_runs = [
+        result
+        for result in results
+        if not result.get("success", False)
+    ]
+
+    return {
+        "success": len(failed_runs) == 0,
+        "dataset_root": request.dataset_root,
+        "total_models": len(results),
+        "successful_models": len(successful_runs),
+        "failed_models": len(failed_runs), #Know which models failed to run benchmark, to debug and fix the issue
+        "results": results
+    }
+
+# api get all benchmark runs
+@app.get("/evaluation-runs")
+def get_evaluation_runs():
+    response = (
+        supabase
+        .table("evaluation_runs")
+        .select("*")
+        .order("started_at", desc=True)
+        .execute()
+    )
+
+    return {
+        "success": True,
+        "total": len(response.data),
+        "runs": response.data
+    }
+
+# api get latest benchmark run by model name
+@app.get("/evaluation-latest-comparison")
+def get_latest_evaluation_comparison():
+    response = (
+        supabase
+        .table("evaluation_runs")
+        .select("*")
+        .eq("status", "completed")
+        .order("completed_at", desc=True)
+        .execute()
+    )
+
+    latest_by_model = {}
+
+    for run in response.data:
+        model_name = run.get("model_name")
+
+        if not model_name:
+            continue
+
+        if model_name not in latest_by_model:
+            latest_by_model[model_name] = run
+
+    ordered_models = []
+
+    for model_name in SUPPORTED_BENCHMARK_MODELS:
+        if model_name in latest_by_model:
+            ordered_models.append(
+                latest_by_model[model_name]
+            )
+
+    return {
+        "success": True,
+        "total_models": len(ordered_models),
+        "models": ordered_models
+    }
+
+# api get benchmark run details by run_id
+@app.get("/evaluation-runs/{run_id}")
+def get_evaluation_run_detail(run_id: str):
+    run_response = (
+        supabase
+        .table("evaluation_runs")
+        .select("*")
+        .eq("run_id", run_id)
+        .limit(1)
+        .execute()
+    )
+
+    if len(run_response.data) == 0:
+        return {
+            "success": False,
+            "message": "Evaluation run not found"
+        }
+
+    results_response = (
+        supabase
+        .table("evaluation_results")
+        .select("*")
+        .eq("run_id", run_id)
+        .order("image_name")
+        .execute()
+    )
+
+    return {
+        "success": True,
+        "run": run_response.data[0],
+        "total_results": len(results_response.data),
+        "results": results_response.data
+    }
+
+# api get evaluation page
+@app.get("/evaluation-page")
+def evaluation_page():
+    return FileResponse(
+        "static/evaluation.html"
+    )
+
+# Create new function to recognize faces by model chosen
+def recognize_faces_with_model(
+    img,
+    model_name: str,
+    cached_users=None,
+    cached_embeddings=None,
+    detection_mode: str = "full"
+):
+    total_start = time.perf_counter()
+
+    # ==============================
+    # 1. Validate input image
+    # ==============================
+    if img is None:
+        return {
+            "success": False,
+            "message": "Input image is missing.",
+            "results": []
+        }
+
+    if not isinstance(img, np.ndarray):
+        raise TypeError(
+            "recognize_faces_with_model expects "
+            "img to be a NumPy ndarray, "
+            f"but received {type(img).__name__}."
+        )
+
+    if img.size == 0:
+        return {
+            "success": False,
+            "message": "Input image is empty.",
+            "results": []
+        }
+
+    # ==============================
+    # 2. Normalize parameters
+    # ==============================
+    normalized_model_name = (
+        model_name
+        .strip()
+        .lower()
+    )
+
+    normalized_detection_mode = (
+        detection_mode
+        .strip()
+        .lower()
+    )
+
+    # ==============================
+    # 3. Load recognition model
+    # ==============================
+    model = get_model(
+        normalized_model_name
+    )
+
+    threshold = get_model_threshold(
+        normalized_model_name
+    )
+
+    # ==============================
+    # 4. Face detection timing
+    # ==============================
+    detection_start = time.perf_counter()
+
+    faces = detect_faces_by_mode(
+        img=img,
+        detection_mode=(
+            normalized_detection_mode
+        )
+    )
+
+    detection_time_ms = (
+        time.perf_counter()
+        - detection_start
+    ) * 1000
+
+    # ==============================
+    # 5. Face-size statistics
+    # ==============================
+    face_widths = []
+    face_heights = []
+
+    for face in faces:
+        x1, y1, x2, y2 = (
+            face.bbox.astype(int)
+        )
+
+        face_width = max(
+            0,
+            int(x2 - x1)
+        )
+
+        face_height = max(
+            0,
+            int(y2 - y1)
+        )
+
+        face_widths.append(
+            face_width
+        )
+
+        face_heights.append(
+            face_height
+        )
+
+    smallest_face_width = (
+        min(face_widths)
+        if face_widths
+        else 0
+    )
+
+    smallest_face_height = (
+        min(face_heights)
+        if face_heights
+        else 0
+    )
+
+    average_face_width = (
+        sum(face_widths)
+        / len(face_widths)
+        if face_widths
+        else 0.0
+    )
+
+    average_face_height = (
+        sum(face_heights)
+        / len(face_heights)
+        if face_heights
+        else 0.0
+    )
+
+    # ==============================
+    # 6. No face detected
+    # ==============================
+    if len(faces) == 0:
+        total_processing_time_ms = (
+            time.perf_counter()
+            - total_start
+        ) * 1000
+
+        return {
+            "success": True,
+            "model_name": (
+                normalized_model_name
+            ),
+            "detection_mode": (
+                normalized_detection_mode
+            ),
+            "threshold": float(
+                threshold
+            ),
+            "total_faces": 0,
+            "detection_time_ms": float(
+                detection_time_ms
+            ),
+            "recognition_time_ms": 0.0,
+            "processing_time_ms": float(
+                total_processing_time_ms
+            ),
+            "smallest_face_width": 0,
+            "smallest_face_height": 0,
+            "average_face_width": 0.0,
+            "average_face_height": 0.0,
+            "results": []
+        }
+
+    # ==============================
+    # 7. Load registered users
+    # ==============================
+    users = (
+        cached_users
+        if cached_users is not None
+        else load_users()
+    )
+
+    if len(users) == 0:
+        total_processing_time_ms = (
+            time.perf_counter()
+            - total_start
+        ) * 1000
+
+        return {
+            "success": False,
+            "message": (
+                "No registered users found."
+            ),
+            "model_name": (
+                normalized_model_name
+            ),
+            "detection_mode": (
+                normalized_detection_mode
+            ),
+            "threshold": float(
+                threshold
+            ),
+            "total_faces": len(faces),
+            "detection_time_ms": float(
+                detection_time_ms
+            ),
+            "recognition_time_ms": 0.0,
+            "processing_time_ms": float(
+                total_processing_time_ms
+            ),
+            "smallest_face_width": int(
+                smallest_face_width
+            ),
+            "smallest_face_height": int(
+                smallest_face_height
+            ),
+            "average_face_width": float(
+                average_face_width
+            ),
+            "average_face_height": float(
+                average_face_height
+            ),
+            "results": []
+        }
+
+    # ==============================
+    # 8. Load mean embeddings
+    # ==============================
+    cloud_embeddings = (
+        cached_embeddings
+        if cached_embeddings is not None
+        else load_cloud_mean_embeddings(
+            normalized_model_name
+        )
+    )
+
+    if len(cloud_embeddings) == 0:
+        total_processing_time_ms = (
+            time.perf_counter()
+            - total_start
+        ) * 1000
+
+        return {
+            "success": False,
+            "message": (
+                f"No {normalized_model_name} "
+                "embeddings found."
+            ),
+            "model_name": (
+                normalized_model_name
+            ),
+            "detection_mode": (
+                normalized_detection_mode
+            ),
+            "threshold": float(
+                threshold
+            ),
+            "total_faces": len(faces),
+            "detection_time_ms": float(
+                detection_time_ms
+            ),
+            "recognition_time_ms": 0.0,
+            "processing_time_ms": float(
+                total_processing_time_ms
+            ),
+            "smallest_face_width": int(
+                smallest_face_width
+            ),
+            "smallest_face_height": int(
+                smallest_face_height
+            ),
+            "average_face_width": float(
+                average_face_width
+            ),
+            "average_face_height": float(
+                average_face_height
+            ),
+            "results": []
+        }
+
+    # ==============================
+    # 9. Recognition timing
+    # ==============================
+    recognition_start = (
+        time.perf_counter()
+    )
+
+    results = []
+
+    for face in faces:
+        try:
+            aligned_face = align_detected_face(
+                image=img,
+                detected_face=face,
+                output_size=112
+            )
+
+            current_embedding = (
+                model.extract_embedding(
+                    aligned_face
+                )
+            )
+
+            x1, y1, x2, y2 = (
+                face.bbox.astype(int)
+            )
+
+            bbox_data = {
+                "x1": int(x1),
+                "y1": int(y1),
+                "x2": int(x2),
+                "y2": int(y2)
+            }
+
+            face_width = max(
+                0,
+                int(x2 - x1)
+            )
+
+            face_height = max(
+                0,
+                int(y2 - y1)
+            )
+
+            best_match = None
+            best_score = -1.0
+
+            for (
+                user_id,
+                saved_embedding
+            ) in cloud_embeddings.items():
+                if user_id not in users:
+                    continue
+
+                score = model.compare(
+                    current_embedding,
+                    saved_embedding
+                )
+
+                score = float(score)
+
+                if score > best_score:
+                    best_score = score
+                    best_match = users[
+                        user_id
+                    ]
+
+            recognized = (
+                best_match is not None
+                and best_score >= threshold
+            )
+
+            detection_score = float(
+                getattr(
+                    face,
+                    "det_score",
+                    0.0
+                )
+            )
+
+            if recognized:
+                results.append({
+                    "recognized": True,
+                    "user_id": best_match[
+                        "user_id"
+                    ],
+                    "full_name": best_match[
+                        "full_name"
+                    ],
+                    "role": best_match[
+                        "role"
+                    ],
+                    "confidence": float(
+                        best_score
+                    ),
+                    "detection_score": (
+                        detection_score
+                    ),
+                    "face_width": (
+                        face_width
+                    ),
+                    "face_height": (
+                        face_height
+                    ),
+                    "bbox": bbox_data
+                })
+
+            else:
+                results.append({
+                    "recognized": False,
+                    "message": (
+                        "Unknown person"
+                    ),
+                    "confidence": float(
+                        best_score
+                    ),
+                    "detection_score": (
+                        detection_score
+                    ),
+                    "face_width": (
+                        face_width
+                    ),
+                    "face_height": (
+                        face_height
+                    ),
+                    "bbox": bbox_data
+                })
+
+        except Exception as error:
+            x1, y1, x2, y2 = (
+                face.bbox.astype(int)
+            )
+
+            results.append({
+                "recognized": False,
+                "message": (
+                    "Face recognition failed."
+                ),
+                "error": str(error),
+                "confidence": -1.0,
+                "bbox": {
+                    "x1": int(x1),
+                    "y1": int(y1),
+                    "x2": int(x2),
+                    "y2": int(y2)
+                }
+            })
+
+    recognition_time_ms = (
+        time.perf_counter()
+        - recognition_start
+    ) * 1000
+
+    total_processing_time_ms = (
+        time.perf_counter()
+        - total_start
+    ) * 1000
+
+    # ==============================
+    # 10. Final response
+    # ==============================
+    recognized_faces = sum(
+        1
+        for result in results
+        if result.get("recognized")
+    )
+
+    unknown_faces = (
+        len(results)
+        - recognized_faces
+    )
+
+    return {
+        "success": True,
+        "model_name": (
+            normalized_model_name
+        ),
+        "detection_mode": (
+            normalized_detection_mode
+        ),
+        "threshold": float(
+            threshold
+        ),
+        "total_faces": len(results),
+        "recognized_faces": (
+            recognized_faces
+        ),
+        "unknown_faces": unknown_faces,
+        "detection_time_ms": float(
+            detection_time_ms
+        ),
+        "recognition_time_ms": float(
+            recognition_time_ms
+        ),
+        "processing_time_ms": float(
+            total_processing_time_ms
+        ),
+        "smallest_face_width": int(
+            smallest_face_width
+        ),
+        "smallest_face_height": int(
+            smallest_face_height
+        ),
+        "average_face_width": float(
+            average_face_width
+        ),
+        "average_face_height": float(
+            average_face_height
+        ),
+        "results": results
+    }
+# Api to test 1 img
+@app.post("/test-recognition-model")
+async def test_recognition_model(
+    model_name: str = Form(...),
+    detection_mode: str = Form("full"),
+    image: UploadFile = File(...)
+):
+    normalized_model_name = (
+        model_name
+        .strip()
+        .lower()
+    )
+
+    normalized_detection_mode = (
+        detection_mode
+        .strip()
+        .lower()
+    )
+
+    if (
+        normalized_detection_mode
+        not in SUPPORTED_DETECTION_MODES
+    ):
+        return {
+            "success": False,
+            "message": (
+                "detection_mode must be "
+                "full, roi, or tiled."
+            ),
+            "received_detection_mode": (
+                detection_mode
+            ),
+            "supported_detection_modes": sorted(
+                SUPPORTED_DETECTION_MODES
+            )
+        }
+
+    if not image.filename:
+        return {
+            "success": False,
+            "message": "Image filename is missing."
+        }
+
+    image_bytes = await image.read()
+
+    if not image_bytes:
+        return {
+            "success": False,
+            "message": "Uploaded image is empty."
+        }
+
+    image_array = np.frombuffer(
+        image_bytes,
+        dtype=np.uint8
+    )
+
+    img = cv2.imdecode(
+        image_array,
+        cv2.IMREAD_COLOR
+    )
+
+    if img is None:
+        return {
+            "success": False,
+            "message": (
+                "Could not decode the uploaded image."
+            ),
+            "filename": image.filename
+        }
+
+    result = recognize_faces_with_model(
+        img=img,
+        model_name=normalized_model_name,
+        detection_mode=(
+            normalized_detection_mode
+        )
+    )
+
+    return {
+        "success": True,
+        "filename": image.filename,
+        "image_width": int(
+            img.shape[1]
+        ),
+        "image_height": int(
+            img.shape[0]
+        ),
+        "detection_mode": (
+            normalized_detection_mode
+        ),
+        "model_name": (
+            normalized_model_name
+        ),
+        "result": result
+    }
 
 def cosine_similarity(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
@@ -175,25 +1374,116 @@ def get_users():
         "users": list(users.values())
     }
 
+@app.get("/users/{user_id}/registration-status")
+def registration_status(
+    user_id: str
+):
+    response = (
+        supabase
+        .table("face_images")
+        .select(
+            "pose,image_path,aligned_image_path"
+        )
+        .eq("user_id", user_id)
+        .execute()
+    )
 
-
-@app.get("/users/{user_id}/embedding-status")
-def embedding_status(user_id: str):
-    embedding_path = f"storage/embeddings/{user_id}.npy"
-
-    pose_files = {
-        "front": os.path.exists(f"storage/embeddings/{user_id}_front.npy"),
-        "left": os.path.exists(f"storage/embeddings/{user_id}_left.npy"),
-        "right": os.path.exists(f"storage/embeddings/{user_id}_right.npy"),
+    pose_status = {
+        "front": False,
+        "left": False,
+        "right": False
     }
+
+    image_records = {}
+
+    for record in response.data:
+        pose = record.get("pose")
+        aligned_path = record.get(
+            "aligned_image_path"
+        )
+
+        if (
+            pose in pose_status
+            and aligned_path
+        ):
+            pose_status[pose] = True
+            image_records[pose] = record
 
     return {
         "success": True,
         "user_id": user_id,
-        "main_embedding_exists": os.path.exists(embedding_path),
-        "pose_embeddings": pose_files
+        "poses": pose_status,
+        "completed_poses": [
+            pose
+            for pose, exists
+            in pose_status.items()
+            if exists
+        ],
+        "missing_poses": [
+            pose
+            for pose, exists
+            in pose_status.items()
+            if not exists
+        ],
+        "registration_complete": all(
+            pose_status.values()
+        ),
+        "images": image_records
     }
 
+# api to check embedding status for a user by user_id and model_name
+@app.get("/users/{user_id}/embedding-status")
+def embedding_status(
+    user_id: str,
+    model_name: str = "buffalo_l"
+):
+    normalized_model_name = (
+        model_name.strip().lower()
+    )
+
+    response = (
+        supabase
+        .table("face_embeddings")
+        .select(
+            "pose,model_name,embedding_path"
+        )
+        .eq("user_id", user_id)
+        .eq(
+            "model_name",
+            normalized_model_name
+        )
+        .execute()
+    )
+
+    pose_status = {
+        "front": False,
+        "left": False,
+        "right": False,
+        "mean": False
+    }
+
+    for record in response.data:
+        pose = record.get("pose")
+
+        if pose in pose_status:
+            pose_status[pose] = True
+
+    return {
+        "success": True,
+        "user_id": user_id,
+        "model_name": normalized_model_name,
+        "pose_embeddings": {
+            "front": pose_status["front"],
+            "left": pose_status["left"],
+            "right": pose_status["right"]
+        },
+        "mean_embedding_exists": (
+            pose_status["mean"]
+        ),
+        "embedding_complete": all(
+            pose_status.values()
+        )
+    }
 def calculate_blur_score(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
@@ -328,15 +1618,24 @@ def upload_file_to_supabase(bucket_name, cloud_path, local_path, content_type):
     return cloud_path
 
 # Save face image metadata to Supabase
-def save_face_image_metadata(user_id, pose, image_path):
+def save_face_image_metadata(
+    user_id: str,
+    pose: str,
+    image_path: str,
+    aligned_image_path: str
+):
     data = {
         "user_id": user_id,
         "pose": pose,
         "image_path": image_path,
+        "aligned_image_path": aligned_image_path,
+        "aligned_size": 112,
         "created_at": datetime.now().isoformat()
     }
-    # use upsert to avoid duplicate entries for same user and pose, if exists then update
-    supabase.table("face_images").upsert(
+
+    supabase.table(
+        "face_images"
+    ).upsert(
         data,
         on_conflict="user_id,pose"
     ).execute()
@@ -349,47 +1648,132 @@ async def register_face(
     pose: str = Form(...),
     image: UploadFile = File(...)
 ):
-    image_bytes = await image.read()
-    np_array = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
+    user_id = user_id.strip()
+    full_name = full_name.strip()
+    role = role.strip().lower()
+    pose = pose.strip().lower()
 
-    blur_score = calculate_blur_score(img)
+    valid_poses = {
+        "front",
+        "left",
+        "right"
+    }
+
+    if not user_id:
+        return {
+            "success": False,
+            "message": "User ID is required."
+        }
+
+    if not full_name:
+        return {
+            "success": False,
+            "message": "Full name is required."
+        }
+
+    if pose not in valid_poses:
+        return {
+            "success": False,
+            "message": (
+                "Pose must be front, left, or right."
+            )
+        }
+
+    # Read uploaded image
+    image_bytes = await image.read()
+
+    if not image_bytes:
+        return {
+            "success": False,
+            "message": "Uploaded image is empty."
+        }
+
+    np_array = np.frombuffer(
+        image_bytes,
+        dtype=np.uint8
+    )
+
+    img = cv2.imdecode(
+        np_array,
+        cv2.IMREAD_COLOR
+    )
+
+    if img is None:
+        return {
+            "success": False,
+            "message": (
+                "Invalid or unsupported image file."
+            )
+        }
+
+    # Image-quality validation
+    blur_score = calculate_blur_score(
+        img
+    )
 
     if blur_score < BLUR_THRESHOLD:
         return {
             "success": False,
-            "message": "Image is too blurry. Please keep your face steady and try again.",
-            "blur_score": blur_score
+            "message": (
+                "Image is too blurry. "
+                "Please keep your face steady."
+            ),
+            "blur_score": float(blur_score)
         }
 
-    brightness = calculate_brightness(img)
+    brightness = calculate_brightness(
+        img
+    )
 
     if brightness < MIN_BRIGHTNESS:
         return {
             "success": False,
-            "message": "Image is too dark. Please move to a brighter place.",
-            "brightness": brightness
+            "message": (
+                "Image is too dark. "
+                "Please move to a brighter place."
+            ),
+            "brightness": float(brightness)
         }
 
     if brightness > MAX_BRIGHTNESS:
         return {
             "success": False,
-            "message": "Image is too bright. Please reduce strong light.",
-            "brightness": brightness
+            "message": (
+                "Image is too bright. "
+                "Please reduce strong light."
+            ),
+            "brightness": float(brightness)
         }
 
-    faces = face_app.get(img)
+    # Shared face detection
+    faces = shared_detector.detect_faces(
+        img
+    )
 
     if len(faces) == 0:
-        return {"success": False, "message": "No face detected"}
+        return {
+            "success": False,
+            "message": "No face detected."
+        }
 
     if len(faces) > 1:
-        return {"success": False, "message": "Multiple faces detected. Please make sure only one person is in front of the camera."}
+        return {
+            "success": False,
+            "message": (
+                "Multiple faces detected. "
+                "Only one person should be visible."
+            )
+        }
 
     face = faces[0]
-    embedding = face.embedding
 
-    size_valid, size_message = validate_face_size(face, img)
+    # Face-size validation
+    size_valid, size_message = (
+        validate_face_size(
+            face,
+            img
+        )
+    )
 
     if not size_valid:
         return {
@@ -397,27 +1781,27 @@ async def register_face(
             "message": size_message
         }
 
-    # bbox = face.bbox
-    # x1, y1, x2, y2 = bbox
+    # Position validation
+    position_valid, position_message = (
+        validate_face_position(
+            face,
+            img
+        )
+    )
 
-    # face_width = x2 - x1
-    # face_height = y2 - y1
+    if not position_valid:
+        return {
+            "success": False,
+            "message": position_message
+        }
 
-    # img_height, img_width = img.shape[:2]
-
-    # face_area = face_width * face_height
-    # img_area = img_width * img_height
-
-    # face_ratio = face_area / img_area
-    # #Size validation
-    # if face_ratio < 0.05:
-    #     return {
-    #         "success": False,
-    #         "message": "Face is too small. Please move closer to the camera.",
-    #         "face_ratio": float(face_ratio)
-    #     }
-
-    pose_valid, pose_message = validate_pose(face, pose)
+    # Pose validation
+    pose_valid, pose_message = (
+        validate_pose(
+            face,
+            pose
+        )
+    )
 
     if not pose_valid:
         return {
@@ -425,133 +1809,195 @@ async def register_face(
             "message": pose_message
         }
 
-    position_valid, position_message = validate_face_position(face, img)
-
-    if not position_valid:
+    # Shared landmark alignment
+    try:
+        aligned_face = align_detected_face(
+            image=img,
+            detected_face=face,
+            output_size=112
+        )
+    except Exception as error:
         return {
             "success": False,
-            "message": position_message
+            "message": (
+                "Face alignment failed: "
+                f"{str(error)}"
+            )
         }
-    user_img_dir = f"storage/images/{user_id}"
-    os.makedirs(user_img_dir, exist_ok=True)
-    # USERS_FILE = "storage/users.json"
 
-    # def save_user_profile(user_id, full_name, role):
-    #     users = {}
+    if (
+        aligned_face is None
+        or aligned_face.size == 0
+    ):
+        return {
+            "success": False,
+            "message": "Aligned face image is empty."
+        }
 
-    #     if os.path.exists(USERS_FILE):
-    #         with open(USERS_FILE, "r", encoding="utf-8") as f:
-    #             users = json.load(f)
+    # Bbox crop for UI/audit
+    face_crop = crop_face_by_bbox(
+        img,
+        face
+    )
 
-    #     users[user_id] = {
-    #         "user_id": user_id,
-    #         "full_name": full_name,
-    #         "role": role,
-    #         "created_at": datetime.now().isoformat()
-    #     }
-
-    #     with open(USERS_FILE, "w", encoding="utf-8") as f:
-    #         json.dump(users, f, indent=4, ensure_ascii=False)
-
-
-
-    # blur_score = calculate_blur_score(img)
-    
-    # if blur_score < 100:  # Threshold can be adjusted
-    #     return {"success": False, "message": "Image is too blurry"}
-
-
-    image_path = f"{user_img_dir}/{pose}.jpg"
-    embedding_path = f"storage/embeddings/{user_id}.npy"
-
-    face_crop = crop_face_by_bbox(img, face)
-
-    if face_crop is None:
+    if (
+        face_crop is None
+        or face_crop.size == 0
+    ):
         return {
             "success": False,
             "message": "Failed to crop face image."
         }
 
-    cv2.imwrite(image_path, face_crop)
-    # upload to Supabase
-    cloud_image_path = f"{user_id}/{pose}.jpg"
+    # Local directory
+    user_image_dir = os.path.join(
+        "storage",
+        "images",
+        user_id
+    )
 
+    os.makedirs(
+        user_image_dir,
+        exist_ok=True
+    )
+
+    crop_image_path = os.path.join(
+        user_image_dir,
+        f"{pose}.jpg"
+    )
+
+    aligned_image_path = os.path.join(
+        user_image_dir,
+        f"{pose}_aligned.jpg"
+    )
+
+    # Save local files
+    crop_saved = cv2.imwrite(
+        crop_image_path,
+        face_crop
+    )
+
+    aligned_saved = cv2.imwrite(
+        aligned_image_path,
+        aligned_face
+    )
+
+    if not crop_saved:
+        return {
+            "success": False,
+            "message": (
+                "Failed to save cropped face image."
+            )
+        }
+
+    if not aligned_saved:
+        return {
+            "success": False,
+            "message": (
+                "Failed to save aligned face image."
+            )
+        }
+
+    # Cloud paths
+    cloud_crop_path = (
+        f"{user_id}/{pose}.jpg"
+    )
+
+    cloud_aligned_path = (
+        f"{user_id}/{pose}_aligned.jpg"
+    )
+
+    # Upload crop
     upload_file_to_supabase(
         bucket_name="face-images",
-        cloud_path=cloud_image_path,
-        local_path=image_path,
+        cloud_path=cloud_crop_path,
+        local_path=crop_image_path,
         content_type="image/jpeg"
     )
-    # Save face image metadata to Supabase
+
+    # Upload aligned image
+    upload_file_to_supabase(
+        bucket_name="face-images",
+        cloud_path=cloud_aligned_path,
+        local_path=aligned_image_path,
+        content_type="image/jpeg"
+    )
+
+    # Save image metadata
     save_face_image_metadata(
         user_id=user_id,
         pose=pose,
-        image_path=cloud_image_path
-    )
-        
-    pose_embedding_path = f"storage/embeddings/{user_id}_{pose}.npy"
-    np.save(pose_embedding_path, embedding)
-
-    # Upload pose embedding to Supabase
-    cloud_pose_embedding_path = f"{user_id}/{pose}.npy"
-
-    upload_file_to_supabase(
-        bucket_name="face-embeddings",
-        cloud_path=cloud_pose_embedding_path,
-        local_path=pose_embedding_path,
-        content_type="application/octet-stream"
-    )
-    # save face embedding metadata to Supabase
-    save_face_embedding_metadata(
-        user_id=user_id,
-        pose=pose,
-        embedding_path=cloud_pose_embedding_path
+        image_path=cloud_crop_path,
+        aligned_image_path=cloud_aligned_path
     )
 
-    all_embeddings = []
+    # Save/update profile
+    save_user_profile(
+        user_id,
+        full_name,
+        role
+    )
 
-    for p in ["front", "left", "right"]:
-        path = f"storage/embeddings/{user_id}_{p}.npy"
-        if os.path.exists(path):
-            all_embeddings.append(np.load(path))
-    # average embedding from 3 poses at local
-    # if len(all_embeddings) > 0:
-    #     mean_embedding = np.mean(all_embeddings, axis=0)
-    #     mean_embedding = mean_embedding / np.linalg.norm(mean_embedding)
-    #     np.save(embedding_path, mean_embedding)
+    # Determine registration progress
+    completed_poses = []
+    missing_poses = []
 
-    if len(all_embeddings) > 0:
-        mean_embedding = np.mean(all_embeddings, axis=0)
-        mean_embedding = mean_embedding / np.linalg.norm(mean_embedding)
-        np.save(embedding_path, mean_embedding)
-        # upload mean embedding to Supabase
-        cloud_mean_embedding_path = f"{user_id}/mean.npy"
-
-        upload_file_to_supabase(
-            bucket_name="face-embeddings",
-            cloud_path=cloud_mean_embedding_path,
-            local_path=embedding_path,
-            content_type="application/octet-stream"
+    for required_pose in [
+        "front",
+        "left",
+        "right"
+    ]:
+        local_aligned_path = os.path.join(
+            user_image_dir,
+            f"{required_pose}_aligned.jpg"
         )
 
-        save_face_embedding_metadata(
-            user_id=user_id,
-            pose="mean",
-            embedding_path=cloud_mean_embedding_path
-        )
+        if os.path.exists(
+            local_aligned_path
+        ):
+            completed_poses.append(
+                required_pose
+            )
+        else:
+            missing_poses.append(
+                required_pose
+            )
 
-    save_user_profile(user_id, full_name, role)
+    registration_complete = (
+        len(completed_poses) == 3
+    )
+
     return {
         "success": True,
-        "message": "Face registered successfully",
+        "message": (
+            "Face image registered successfully."
+        ),
         "user_id": user_id,
         "full_name": full_name,
         "role": role,
-        "image_path": image_path,
-        "embedding_path": embedding_path,
-        "embedding_shape": embedding.shape
+        "pose": pose,
+        "crop_image_path": crop_image_path,
+        "aligned_image_path": (
+            aligned_image_path
+        ),
+        "cloud_crop_path": cloud_crop_path,
+        "cloud_aligned_path": (
+            cloud_aligned_path
+        ),
+        "aligned_shape": list(
+            aligned_face.shape
+        ),
+        "completed_poses": completed_poses,
+        "missing_poses": missing_poses,
+        "registration_complete": (
+            registration_complete
+        ),
+        "embedding_created": False,
+        "next_step": (
+            "Generate model embeddings after "
+            "registration is complete."
+        )
     }
-
 # Test supabase connection, return one user from "users" table if exists enough to verify connection
 @app.get("/test-supabase")
 def test_supabase():
@@ -617,7 +2063,8 @@ async def validate_face_api(
             "brightness": brightness
         }
 
-    faces = face_app.get(img)
+    # faces = face_app.get(img)
+    faces = shared_detector.detect_faces(img)
 
     if len(faces) == 0:
         return {"success": False, "message": "No face detected."}
@@ -626,6 +2073,17 @@ async def validate_face_api(
         return {"success": False, "message": "Multiple faces detected."}
 
     face = faces[0]
+    try:
+        align_detected_face(
+            image=img,
+            detected_face=face,
+            output_size=112
+        )
+    except Exception:
+        return {
+            "success": False,
+            "message": "Face alignment failed."
+        }
 
     size_valid, size_message = validate_face_size(face, img)
     if not size_valid:
@@ -644,8 +2102,7 @@ async def validate_face_api(
         "message": "Face is valid for capture."
     }
 
-
-
+# api to serve users.html page
 @app.get("/users-page")
 def users_page():
     return FileResponse("static/users.html")
@@ -765,17 +2222,18 @@ def delete_user(user_id: str):
 
 
 # Save face embedding metadata to Supabase
-def save_face_embedding_metadata(user_id, pose, embedding_path):
+def save_face_embedding_metadata(user_id, pose, model_name, embedding_path):
     data = {
         "user_id": user_id,
         "pose": pose,
+        "model_name": model_name,
         "embedding_path": embedding_path,
         "created_at": datetime.now().isoformat()
     }
     # use upsert to avoid duplicate entries for same user and pose, will update
     supabase.table("face_embeddings").upsert(
         data,
-        on_conflict="user_id,pose"
+        on_conflict="user_id,pose,model_name"
     ).execute()
 
 # old Api check if user exists by read json local file
@@ -903,110 +2361,126 @@ def load_embedding_from_cloud(embedding_path):
     return embedding
 
 # Load mean embeddings for all users from Supabase, return dict of user_id to embedding
-def load_cloud_mean_embeddings():
+def load_cloud_mean_embeddings(model_name: str):
     response = (
         supabase
         .table("face_embeddings")
-        .select("user_id, pose, embedding_path")
+        .select("user_id, pose, model_name, embedding_path")
         .eq("pose", "mean")
+        .eq("model_name", model_name)
         .execute()
     )
+    # model_name that guarantee to be the same as the one used for recognition, so we can filter by model_name
 
     embeddings = {}
 
     for item in response.data:
-        user_id = item["user_id"]
-        embedding_path = item["embedding_path"]
-
         try:
-            embeddings[user_id] = load_embedding_from_cloud(embedding_path)
-        except Exception as e:
-            print(f"Failed to load embedding for {user_id}: {e}")
+            embeddings[item["user_id"]] = (
+                load_embedding_from_cloud(
+                    item["embedding_path"]
+                )
+            )
+            print(
+                f"Loaded {len(embeddings)} mean embeddings "
+                f"for model {model_name}"
+            )
+        except Exception as error:
+            print(
+                f"Failed to load {model_name} embedding "
+                f"for {item['user_id']}: {error}"
+            )
 
     return embeddings
 
 # new function to recognize faces from frame
-def recognize_faces_from_frame(img):
-    faces = face_app.get(img)
+# def recognize_faces_from_frame(img):
+#     # faces = face_app.get(img)
+#     faces = recognition_model.detect_faces(img)
 
-    if len(faces) == 0:
-        return {
-            "success": False,
-            "message": "No face detected"
-        }
+#     if len(faces) == 0:
+#         return []
 
+#     users = load_users()
+#     if len(users) == 0:
+#         return []
+#     # put cloud embedding loading here to avoid loading if no faces detected, but only load once for all faces in this image, not load for each face to save time
+#     cloud_embeddings = load_cloud_mean_embeddings(recognition_model.model_name)
+    
 
+#     results = []
 
-    users = load_users()
+#     for face in faces:
+#         current_embedding = recognition_model.extract_embedding(img, face)
 
-    # put cloud embedding loading here to avoid loading if no faces detected, but only load once for all faces in this image, not load for each face to save time
-    cloud_embeddings = load_cloud_mean_embeddings()
-    if len(users) == 0:
-        return {
-            "success": False,
-            "message": "No registered users found"
-        }
+#         bbox = face.bbox
+#         x1, y1, x2, y2 = bbox.astype(int)
 
-    results = []
+#         bbox_data = {
+#             "x1": int(x1),
+#             "y1": int(y1),
+#             "x2": int(x2),
+#             "y2": int(y2)
+#         }
 
-    for face in faces:
-        current_embedding = face.embedding
+#         best_match = None
+#         best_score = -1
 
-        bbox = face.bbox
-        x1, y1, x2, y2 = bbox.astype(int)
+#         # cloud_embeddings = load_cloud_mean_embeddings()
 
-        bbox_data = {
-            "x1": int(x1),
-            "y1": int(y1),
-            "x2": int(x2),
-            "y2": int(y2)
-        }
+#         for user_id, user_info in users.items():
+#             if user_id not in cloud_embeddings:
+#                 continue
 
-        best_match = None
-        best_score = -1
+#             saved_embedding = cloud_embeddings[user_id]
+#             score = recognition_model.compare(
+#                 current_embedding,
+#                 saved_embedding
+#             )
+#             # score = cosine_similarity(current_embedding, saved_embedding)
 
-        # cloud_embeddings = load_cloud_mean_embeddings()
+#             if score > best_score:
+#                 best_score = score
+#                 best_match = user_info
 
-        for user_id, user_info in users.items():
-            if user_id not in cloud_embeddings:
-                continue
+#         if best_match is None:
+#             results.append({
+#                 "recognized": False,
+#                 "message": "No registered embeddings found",
+#                 "confidence": best_score,
+#                 "bbox": bbox_data
+#             })
+#             continue
 
-            saved_embedding = cloud_embeddings[user_id]
-            score = cosine_similarity(current_embedding, saved_embedding)
-
-            if score > best_score:
-                best_score = score
-                best_match = user_info
-
-        if best_match is None:
-            results.append({
-                "recognized": False,
-                "message": "No registered embeddings found",
-                "confidence": best_score,
-                "bbox": bbox_data
-            })
-            continue
-
-        if best_score < RECOGNITION_THRESHOLD:
-            results.append({
-                "recognized": False,
-                "message": "Unknown person",
-                "confidence": best_score,
-                "bbox": bbox_data
-            })
-            continue
+#         if best_score < RECOGNITION_THRESHOLD:
+#             results.append({
+#                 "recognized": False,
+#                 "message": "Unknown person",
+#                 "confidence": best_score,
+#                 "bbox": bbox_data
+#             })
+#             continue
 
 
-        results.append({
-            "recognized": True,
-            "message": "User recognized",
-            "user_id": best_match["user_id"],
-            "full_name": best_match["full_name"],
-            "role": best_match["role"],
-            "confidence": best_score,
-            "bbox": bbox_data
-        })
-    return results
+#         results.append({
+#             "recognized": True,
+#             "message": "User recognized",
+#             "user_id": best_match["user_id"],
+#             "full_name": best_match["full_name"],
+#             "role": best_match["role"],
+#             "confidence": best_score,
+#             "bbox": bbox_data
+#         })
+#     return results
+
+def recognize_faces_from_frame(img, detection_mode: str = "full"):
+    recognition_result = recognize_faces_with_model(
+        img=img,
+        model_name=ACTIVE_MODEL_NAME,
+        detection_mode=detection_mode
+    )
+
+    return recognition_result.get("results", [])
 
 # api recognize face for attendance
 @app.post("/recognize-face")
@@ -1020,7 +2494,7 @@ async def recognize_face(
     np_array = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
 
-    results = recognize_faces_from_frame(img)
+    results = recognize_faces_from_frame(img, detection_mode="full")
 
     if len(results) == 0:
         return {
@@ -1096,6 +2570,462 @@ async def recognize_face(
         "total_faces": len(final_results),
         "results": final_results
     }
+
+# Class RTSP camera Service 
+class HikvisionRTSPService:
+
+    def __init__(self):
+        self.capture = None
+        self.worker_thread = None
+
+        self.running = False
+        self.last_error = None
+
+        self.latest_jpeg = None
+        self.latest_results = []
+
+        self.frame_lock = threading.Lock()
+        self.state_lock = threading.Lock()
+
+        self.cached_users = {}
+        self.cached_embeddings = {}
+
+    def reload_recognition_data(self):
+        self.cached_users = load_users()
+
+        self.cached_embeddings = (
+            load_cloud_mean_embeddings(
+                ACTIVE_MODEL_NAME
+            )
+        )
+
+        return {
+            "registered_users": len(
+                self.cached_users
+            ),
+            "mean_embeddings": len(
+                self.cached_embeddings
+            ),
+            "model_name": ACTIVE_MODEL_NAME
+        }
+
+    def _open_capture(self):
+        rtsp_url = (
+            build_hikvision_rtsp_url()
+        )
+
+        capture = cv2.VideoCapture(
+            rtsp_url,
+            cv2.CAP_FFMPEG
+        )
+
+        if not capture.isOpened():
+            capture.release()
+
+            # Fallback to OpenCV default backend
+            capture = cv2.VideoCapture(
+                rtsp_url
+            )
+
+        if not capture.isOpened():
+            capture.release()
+            return None
+
+        # This may reduce latency when supported
+        # by the selected OpenCV backend.
+        capture.set(
+            cv2.CAP_PROP_BUFFERSIZE,
+            1
+        )
+
+        return capture
+
+    def start(self):
+        with self.state_lock:
+            if self.running:
+                return {
+                    "success": True,
+                    "message": (
+                        "Hikvision camera is "
+                        "already running."
+                    )
+                }
+
+            try:
+                capture = self._open_capture()
+
+                if capture is None:
+                    self.last_error = (
+                        "Could not open Hikvision "
+                        "RTSP stream."
+                    )
+
+                    return {
+                        "success": False,
+                        "message": self.last_error
+                    }
+
+                cache_status = (
+                    self.reload_recognition_data()
+                )
+
+                self.capture = capture
+                self.running = True
+                self.last_error = None
+                self.latest_results = []
+
+                self.worker_thread = (
+                    threading.Thread(
+                        target=self._camera_loop,
+                        daemon=True
+                    )
+                )
+
+                self.worker_thread.start()
+
+                return {
+                    "success": True,
+                    "message": (
+                        "Hikvision RTSP camera "
+                        "started successfully."
+                    ),
+                    "camera_id": (
+                        HIKVISION_CAMERA_ID
+                    ),
+                    "camera_location": (
+                        HIKVISION_CAMERA_LOCATION
+                    ),
+                    "recognition_cache": (
+                        cache_status
+                    )
+                }
+
+            except Exception as error:
+                self.running = False
+                self.last_error = str(error)
+
+                if self.capture is not None:
+                    self.capture.release()
+                    self.capture = None
+
+                return {
+                    "success": False,
+                    "message": str(error)
+                }
+
+    def stop(self):
+        with self.state_lock:
+            self.running = False
+
+            if self.capture is not None:
+                self.capture.release()
+                self.capture = None
+
+            with self.frame_lock:
+                self.latest_jpeg = None
+                self.latest_results = []
+
+            return {
+                "success": True,
+                "message": (
+                    "Hikvision RTSP camera stopped."
+                )
+            }
+
+    def _process_attendance(
+        self,
+        results: list[dict]
+    ):
+        for face in results:
+            if not face.get("recognized"):
+                continue
+
+            logged = save_attendance_log(
+                user_id=face["user_id"],
+                full_name=face["full_name"],
+                role=face["role"],
+                confidence=face["confidence"],
+                camera_id=HIKVISION_CAMERA_ID,
+                camera_location=(
+                    HIKVISION_CAMERA_LOCATION
+                ),
+                camera_type=(
+                    HIKVISION_CAMERA_TYPE
+                )
+            )
+
+            # Only create an attendance candidate
+            # when a new detection log was accepted.
+            if (
+                logged
+                and face["role"] == "student"
+            ):
+                save_attendance_candidate(
+                    user_id=face["user_id"],
+                    full_name=face["full_name"],
+                    role=face["role"],
+                    confidence=face["confidence"],
+                    camera_id=(
+                        HIKVISION_CAMERA_ID
+                    ),
+                    camera_location=(
+                        HIKVISION_CAMERA_LOCATION
+                    ),
+                    camera_type=(
+                        HIKVISION_CAMERA_TYPE
+                    )
+                )
+
+    def _camera_loop(self):
+        last_recognition_time = 0.0
+        consecutive_read_failures = 0
+
+        try:
+            while self.running:
+                if self.capture is None:
+                    self.last_error = (
+                        "RTSP capture is missing."
+                    )
+                    break
+
+                success, frame = (
+                    self.capture.read()
+                )
+
+                if not success or frame is None:
+                    consecutive_read_failures += 1
+
+                    if (
+                        consecutive_read_failures
+                        >= 30
+                    ):
+                        self.last_error = (
+                            "Lost connection to "
+                            "Hikvision RTSP stream."
+                        )
+                        break
+
+                    time.sleep(0.1)
+                    continue
+
+                consecutive_read_failures = 0
+
+                current_time = (
+                    time.monotonic()
+                )
+
+                should_recognize = (
+                    current_time
+                    - last_recognition_time
+                    >= RTSP_RECOGNITION_INTERVAL_SECONDS
+                )
+
+                if should_recognize:
+                    try:
+                        recognition_result = (
+                            recognize_faces_with_model(
+                                img=frame,
+                                model_name=(
+                                    ACTIVE_MODEL_NAME
+                                ),
+                                cached_users=(
+                                    self.cached_users
+                                ),
+                                cached_embeddings=(
+                                    self.cached_embeddings
+                                )
+                            )
+                        )
+
+                        self.latest_results = (
+                            recognition_result.get(
+                                "results",
+                                []
+                            )
+                        )
+
+                        self._process_attendance(
+                            self.latest_results
+                        )
+
+                    except Exception as error:
+                        self.last_error = (
+                            "Recognition error: "
+                            f"{error}"
+                        )
+
+                    last_recognition_time = (
+                        current_time
+                    )
+
+                display_frame = (
+                    draw_live_camera_results(
+                        frame,
+                        self.latest_results
+                    )
+                )
+
+                height, width = (
+                    display_frame.shape[:2]
+                )
+
+                max_display_width = 1280
+
+                if width > max_display_width:
+                    scale = (
+                        max_display_width
+                        / width
+                    )
+
+                    display_frame = cv2.resize(
+                        display_frame,
+                        (
+                            max_display_width,
+                            int(height * scale)
+                        ),
+                        interpolation=(
+                            cv2.INTER_AREA
+                        )
+                    )
+
+                encoded, jpeg = cv2.imencode(
+                    ".jpg",
+                    display_frame,
+                    [
+                        cv2.IMWRITE_JPEG_QUALITY,
+                        80
+                    ]
+                )
+
+                if not encoded:
+                    continue
+
+                with self.frame_lock:
+                    self.latest_jpeg = (
+                        jpeg.tobytes()
+                    )
+
+        finally:
+            self.running = False
+
+            if self.capture is not None:
+                self.capture.release()
+                self.capture = None
+
+    def mjpeg_generator(self):
+        while self.running:
+            with self.frame_lock:
+                jpeg = self.latest_jpeg
+
+            if jpeg is None:
+                time.sleep(0.05)
+                continue
+
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Cache-Control: no-cache\r\n\r\n"
+                + jpeg
+                + b"\r\n"
+            )
+
+            time.sleep(0.03)
+
+    def get_status(self):
+        return {
+            "success": True,
+            "running": self.running,
+            "camera_id": (
+                HIKVISION_CAMERA_ID
+            ),
+            "camera_location": (
+                HIKVISION_CAMERA_LOCATION
+            ),
+            "camera_type": (
+                HIKVISION_CAMERA_TYPE
+            ),
+            "model_name": ACTIVE_MODEL_NAME,
+            "recognition_interval_seconds": (
+                RTSP_RECOGNITION_INTERVAL_SECONDS
+            ),
+            "cached_users": len(
+                self.cached_users
+            ),
+            "cached_embeddings": len(
+                self.cached_embeddings
+            ),
+            "last_error": self.last_error
+        }
+    
+# Camera API
+hikvision_camera = HikvisionRTSPService()
+@app.post("/camera/start")
+def start_hikvision_camera():
+    return hikvision_camera.start()
+
+
+@app.post("/camera/stop")
+def stop_hikvision_camera():
+    return hikvision_camera.stop()
+
+
+@app.get("/camera/status")
+def get_hikvision_camera_status():
+    return hikvision_camera.get_status()
+
+
+@app.post("/camera/reload-recognition-data")
+def reload_camera_recognition_data():
+    try:
+        cache_status = (
+            hikvision_camera
+            .reload_recognition_data()
+        )
+
+        return {
+            "success": True,
+            "message": (
+                "Recognition data reloaded."
+            ),
+            **cache_status
+        }
+
+    except Exception as error:
+        return {
+            "success": False,
+            "message": str(error)
+        }
+
+
+@app.get("/camera/feed")
+def hikvision_camera_feed():
+    if not hikvision_camera.running:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": (
+                    "Camera is not running. "
+                    "Call POST /camera/start first."
+                )
+            }
+        )
+
+    return StreamingResponse(
+        hikvision_camera.mjpeg_generator(),
+        media_type=(
+            "multipart/x-mixed-replace;"
+            "boundary=frame"
+        ),
+        headers={
+            "Cache-Control": (
+                "no-store, no-cache, "
+                "must-revalidate"
+            ),
+            "Pragma": "no-cache"
+        }
+    )
+
 
 # api view unknown faces
 @app.get("/unknown-faces")
@@ -1401,12 +3331,90 @@ def cloud_health():
 
     return health
 
+def insert_video_session(
+    session_id: str,
+    class_name: str,
+    camera_id: str,
+    camera_location: str,
+    video_name: str,
+    sample_interval_seconds: float
+):
+    session_data = {
+        "session_id": session_id,
+        "class_name": class_name,
+        "camera_id": camera_id,
+        "camera_location": camera_location,
+        "video_name": video_name,
+        "duration_seconds": 0.0,
+        "total_windows": 0,
+        "sample_interval_seconds": float(
+            sample_interval_seconds
+        )
+    }
 
+    print("[VIDEO SESSION INSERT REQUEST]")
+    print(session_data)
+
+    response = (
+        supabase
+        .table("video_sessions")
+        .insert(session_data)
+        .execute()
+    )
+
+    print(
+        "[VIDEO SESSION INSERT RESPONSE]",
+        response.data
+    )
+
+    if not response.data:
+        raise RuntimeError(
+            "Video session was not inserted into video_sessions."
+        )
+
+    return response.data[0]
+
+def update_video_session_result(
+    session_id: str,
+    duration_seconds: float,
+    total_windows: int
+):
+    update_data = {
+        "duration_seconds": float(
+            duration_seconds
+        ),
+        "total_windows": int(
+            total_windows
+        )
+    }
+
+    print("[VIDEO SESSION UPDATE REQUEST]")
+    print("session_id:", session_id)
+    print("update_data:", update_data)
+
+    response = (
+        supabase
+        .table("video_sessions")
+        .update(update_data)
+        .eq("session_id", session_id)
+        .execute()
+    )
+
+    print(
+        "[VIDEO SESSION UPDATE RESPONSE]",
+        response.data
+    )
+
+    if not response.data:
+        raise RuntimeError(
+            "Video session was not updated."
+        )
+
+    return response.data[0]
 # ------------------------------------------------
 # api create video session
 @app.post("/video-sessions")
 def create_video_session(
-    session_id: str = Form(...),
     class_name: str = Form(...),
     camera_id: str = Form(...),
     camera_location: str = Form(...),
@@ -1415,28 +3423,39 @@ def create_video_session(
     total_windows: int = Form(0),
     sample_interval_seconds: float = Form(5)
 ):
+    session_id = str(uuid.uuid4())
+
     data = {
         "session_id": session_id,
-        "class_name": class_name,
-        "camera_id": camera_id,
-        "camera_location": camera_location,
-        "video_name": video_name,
-        "duration_seconds": duration_seconds,
-        "total_windows": total_windows,
-        "sample_interval_seconds": sample_interval_seconds
+        "class_name": class_name.strip(),
+        "camera_id": camera_id.strip(),
+        "camera_location": camera_location.strip(),
+        "video_name": video_name.strip(),
+        "duration_seconds": float(duration_seconds),
+        "total_windows": int(total_windows),
+        "sample_interval_seconds": float(
+            sample_interval_seconds
+        )
     }
 
-    supabase.table("video_sessions").upsert(
-        data,
-        on_conflict="session_id"
-    ).execute()
+    response = (
+        supabase
+        .table("video_sessions")
+        .insert(data)
+        .execute()
+    )
+
+    if not response.data:
+        return {
+            "success": False,
+            "message": "Video session was not created."
+        }
 
     return {
         "success": True,
-        "message": "Video session created successfully",
-        "session": data
+        "message": "Video session created successfully.",
+        "session": response.data[0]
     }
-
 # api view video sessions
 @app.get("/video-sessions")
 def get_video_sessions():
@@ -1453,120 +3472,528 @@ def get_video_sessions():
         "total": len(response.data),
         "sessions": response.data
     }
-
-# api process video 
+# api process video upload and recognize faces
 @app.post("/process-video")
 async def process_video(
-    session_id: str = Form(...),
+
     class_name: str = Form(...),
     camera_id: str = Form(...),
     camera_location: str = Form(...),
     sample_interval_seconds: float = Form(5),
+    detection_mode: str = Form("tiled"),
     video: UploadFile = File(...)
 ):
-    video_path = f"storage/videos/{session_id}_{video.filename}"
+    # =========================================
+    # 1. Normalize inputs
+    # =========================================
+    class_name = class_name.strip()
+    camera_id = camera_id.strip()
+    camera_location = camera_location.strip()
 
-    with open(video_path, "wb") as f:
-        f.write(await video.read())
+    normalized_detection_mode = (
+        detection_mode
+        .strip()
+        .lower()
+    )
 
-    cap = cv2.VideoCapture(video_path)
+    # =========================================
+    # 2. Validate inputs
+    # =========================================
+    if not class_name:
+        return {
+            "success": False,
+            "message": "class_name is required."
+        }
+
+    if not camera_id:
+        return {
+            "success": False,
+            "message": "camera_id is required."
+        }
+
+    if not camera_location:
+        return {
+            "success": False,
+            "message": "camera_location is required."
+        }
+
+    if (
+        normalized_detection_mode
+        not in SUPPORTED_DETECTION_MODES
+    ):
+        return {
+            "success": False,
+            "message": (
+                "detection_mode must be "
+                "full, roi, or tiled."
+            ),
+            "received_detection_mode": detection_mode,
+            "supported_detection_modes": sorted(
+                SUPPORTED_DETECTION_MODES
+            )
+        }
+
+    if sample_interval_seconds <= 0:
+        return {
+            "success": False,
+            "message": (
+                "sample_interval_seconds "
+                "must be greater than 0."
+            )
+        }
+
+    if not video.filename:
+        return {
+            "success": False,
+            "message": "Video filename is missing."
+        }
+
+    allowed_video_extensions = {
+        ".mp4",
+        ".avi",
+        ".mov",
+        ".mkv"
+    }
+
+    safe_video_name = os.path.basename(
+        video.filename
+    )
+
+    video_extension = os.path.splitext(
+        safe_video_name
+    )[1].lower()
+
+    if (
+        video_extension
+        not in allowed_video_extensions
+    ):
+        return {
+            "success": False,
+            "message": "Unsupported video format.",
+            "allowed_extensions": sorted(
+                allowed_video_extensions
+            )
+        }
+
+    # =========================================
+    # 3. Generate session ID in backend
+    # =========================================
+    session_id = str(
+        uuid.uuid4()
+    )
+
+    print(
+        "[NEW VIDEO SESSION]",
+        session_id
+    )
+
+    # =========================================
+    # 4. Save uploaded video locally
+    # =========================================
+    os.makedirs(
+        "storage/videos",
+        exist_ok=True
+    )
+
+    video_path = os.path.join(
+        "storage",
+        "videos",
+        f"{session_id}_{safe_video_name}"
+    )
+
+    video_bytes = await video.read()
+
+    if not video_bytes:
+        return {
+            "success": False,
+            "message": "Uploaded video is empty.",
+            "session_id": session_id
+        }
+
+    try:
+        with open(video_path, "wb") as file:
+            file.write(video_bytes)
+
+    except OSError as error:
+        return {
+            "success": False,
+            "message": (
+                "Failed to save uploaded video."
+            ),
+            "session_id": session_id,
+            "error": str(error)
+        }
+
+    # =========================================
+    # 5. Open video and read metadata
+    # =========================================
+    cap = cv2.VideoCapture(
+        video_path
+    )
 
     if not cap.isOpened():
         return {
             "success": False,
-            "message": "Failed to open video file."
+            "message": "Failed to open video file.",
+            "session_id": session_id,
+            "video_path": video_path
         }
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    fps = float(
+        cap.get(cv2.CAP_PROP_FPS)
+    )
 
-    if fps == 0:
+    frame_count = int(
+        cap.get(
+            cv2.CAP_PROP_FRAME_COUNT
+        )
+    )
+
+    if fps <= 0:
         cap.release()
+
         return {
             "success": False,
-            "message": "Invalid video FPS."
+            "message": "Invalid video FPS.",
+            "session_id": session_id
         }
 
-    duration_seconds = frame_count / fps
-    frame_step = int(fps * sample_interval_seconds)
+    duration_seconds = (
+        frame_count / fps
+    )
 
-    if frame_step <= 0:
-        frame_step = 1
+    frame_step = max(
+        1,
+        int(
+            fps
+            * sample_interval_seconds
+        )
+    )
+
+    # =========================================
+    # 6. Insert parent session before children
+    # =========================================
+    try:
+        created_session = insert_video_session(
+            session_id=session_id,
+            class_name=class_name,
+            camera_id=camera_id,
+            camera_location=camera_location,
+            video_name=safe_video_name,
+            sample_interval_seconds=(
+                sample_interval_seconds
+            )
+        )
+
+    except Exception as error:
+        cap.release()
+
+        return {
+            "success": False,
+            "message": (
+                "Failed to create video session."
+            ),
+            "session_id": session_id,
+            "error": str(error)
+        }
 
     total_windows = 0
     frame_index = 0
+    total_detected_faces = 0
+    total_recognized_faces = 0
+    total_unknown_faces = 0
+    evidence_save_failures = 0
+    detection_log_failures = 0
 
-    while True:
-        ret, frame = cap.read()
+    # =========================================
+    # 7. Process sampled frames
+    # =========================================
+    try:
+        while True:
+            ret, frame = cap.read()
 
-        if not ret:
-            break
+            if not ret:
+                break
 
-        if frame_index % frame_step == 0:
+            if (
+                frame_index
+                % frame_step
+                == 0
+            ):
+                total_windows += 1
 
-            total_windows += 1
-
-            frame_time_seconds = frame_index / fps
-
-            results = recognize_faces_from_frame(frame)
-# add video evidence frame if any recognized faces detected
-            if len(results) > 0:
-                save_video_evidence_frame(
-                    session_id=session_id,
-                    class_name=class_name,
-                    camera_id=camera_id,
-                    frame_time_seconds=frame_time_seconds,
-                    frame=frame,
-                    results=results
+                frame_time_seconds = (
+                    frame_index / fps
                 )
 
-            for face in results:
-                log_data = {
-                    "session_id": session_id,
-                    "class_name": class_name,
-                    "camera_id": camera_id,
-                    "camera_location": camera_location,
-                    "frame_time_seconds": frame_time_seconds,
-                    "user_id": face.get("user_id"),
-                    "full_name": face.get("full_name"),
-                    "confidence": face.get("confidence"),
-                    "status": (
-                        "recognized"
-                        if face.get("recognized")
-                        else "unknown"
+                results = (
+                    recognize_faces_from_frame(
+                        img=frame,
+                        detection_mode=(
+                            normalized_detection_mode
+                        )
                     )
-                }
+                )
 
-                supabase.table(
-                    "video_detection_logs"
-                ).insert(log_data).execute()
+                total_detected_faces += len(
+                    results
+                )
 
-        frame_index += 1
+                recognized_count = sum(
+                    1
+                    for face in results
+                    if face.get("recognized")
+                )
 
-    cap.release()
+                unknown_count = (
+                    len(results)
+                    - recognized_count
+                )
 
-    session_data = {
-        "session_id": session_id,
-        "class_name": class_name,
-        "camera_id": camera_id,
-        "camera_location": camera_location,
-        "video_name": video.filename,
-        "duration_seconds": duration_seconds,
-        "total_windows": total_windows,
-        "sample_interval_seconds": sample_interval_seconds
-    }
+                total_recognized_faces += (
+                    recognized_count
+                )
 
-    supabase.table("video_sessions").upsert(
-        session_data,
-        on_conflict="session_id"
-    ).execute()
-    summary_result = generate_video_attendance_summary(session_id)
+                total_unknown_faces += (
+                    unknown_count
+                )
+
+                # Evidence is optional.
+                # Failure must not terminate video processing.
+                if results:
+                    try:
+                        save_video_evidence_frame(
+                            session_id=session_id,
+                            class_name=class_name,
+                            camera_id=camera_id,
+                            frame_time_seconds=(
+                                frame_time_seconds
+                            ),
+                            frame=frame,
+                            results=results
+                        )
+
+                    except Exception as error:
+                        evidence_save_failures += 1
+
+                        print(
+                            "[WARNING] Evidence frame "
+                            "save failed."
+                        )
+
+                        print(
+                            "session_id:",
+                            session_id
+                        )
+
+                        print(
+                            "frame_time_seconds:",
+                            frame_time_seconds
+                        )
+
+                        print(
+                            "error:",
+                            str(error)
+                        )
+
+                # Save one detection log per face.
+                for face in results:
+                    log_data = {
+                        "session_id": session_id,
+                        "class_name": class_name,
+                        "camera_id": camera_id,
+                        "camera_location": (
+                            camera_location
+                        ),
+                        "frame_time_seconds": (
+                            float(
+                                frame_time_seconds
+                            )
+                        ),
+                        "user_id": face.get(
+                            "user_id"
+                        ),
+                        "full_name": face.get(
+                            "full_name"
+                        ),
+                        "confidence": (
+                            float(
+                                face.get(
+                                    "confidence"
+                                )
+                            )
+                            if face.get(
+                                "confidence"
+                            ) is not None
+                            else None
+                        ),
+                        "status": (
+                            "recognized"
+                            if face.get(
+                                "recognized"
+                            )
+                            else "unknown"
+                        )
+                    }
+
+                    try:
+                        (
+                            supabase
+                            .table(
+                                "video_detection_logs"
+                            )
+                            .insert(
+                                log_data
+                            )
+                            .execute()
+                        )
+
+                    except Exception as error:
+                        detection_log_failures += 1
+
+                        print(
+                            "[WARNING] Detection log "
+                            "insert failed."
+                        )
+
+                        print(
+                            "session_id:",
+                            session_id
+                        )
+
+                        print(
+                            "error:",
+                            str(error)
+                        )
+
+            frame_index += 1
+
+    except Exception as error:
+        print(
+            "[PROCESS VIDEO ERROR]",
+            str(error)
+        )
+
+        return {
+            "success": False,
+            "message": (
+                "Video processing failed."
+            ),
+            "session_id": session_id,
+            "error": str(error),
+            "total_windows_processed": (
+                total_windows
+            )
+        }
+
+    finally:
+        cap.release()
+
+    # =========================================
+    # 8. Update session after processing
+    # =========================================
+    try:
+        updated_session = (
+            update_video_session_result(
+                session_id=session_id,
+                duration_seconds=(
+                    duration_seconds
+                ),
+                total_windows=(
+                    total_windows
+                )
+            )
+        )
+
+    except Exception as error:
+        return {
+            "success": False,
+            "message": (
+                "Video was processed, but the "
+                "video session could not be updated."
+            ),
+            "session_id": session_id,
+            "duration_seconds": (
+                duration_seconds
+            ),
+            "total_windows": total_windows,
+            "error": str(error)
+        }
+
+    # =========================================
+    # 9. Generate attendance summary
+    # =========================================
+    try:
+        summary_result = (
+            generate_video_attendance_summary(
+                session_id
+            )
+        )
+
+    except Exception as error:
+        print(
+            "[WARNING] Attendance summary "
+            "generation failed:",
+            str(error)
+        )
+
+        summary_result = {
+            "success": False,
+            "message": (
+                "Attendance summary could not "
+                "be generated."
+            ),
+            "error": str(error)
+        }
+
+    # =========================================
+    # 10. Final response
+    # =========================================
     return {
         "success": True,
-        "message": "Video processed successfully.",
+        "message": (
+            "Video processed successfully."
+        ),
         "session_id": session_id,
-        "duration_seconds": duration_seconds,
-        "total_windows": total_windows,
+        "video_name": safe_video_name,
+        "detection_mode": (
+            normalized_detection_mode
+        ),
+        "duration_seconds": float(
+            duration_seconds
+        ),
+        "frame_count": int(
+            frame_count
+        ),
+        "fps": float(
+            fps
+        ),
+        "frame_step": int(
+            frame_step
+        ),
+        "sample_interval_seconds": float(
+            sample_interval_seconds
+        ),
+        "total_windows": int(
+            total_windows
+        ),
+        "total_detected_faces": int(
+            total_detected_faces
+        ),
+        "total_recognized_faces": int(
+            total_recognized_faces
+        ),
+        "total_unknown_faces": int(
+            total_unknown_faces
+        ),
+        "evidence_save_failures": int(
+            evidence_save_failures
+        ),
+        "detection_log_failures": int(
+            detection_log_failures
+        ),
+        "created_session": created_session,
+        "updated_session": updated_session,
         "summary_result": summary_result
     }
 

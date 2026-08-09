@@ -20,6 +20,52 @@
                 <option value="cam_hallway_a_02">Hallway Camera - Hallway A Floor 2</option>
             </select>
         </div>
+        
+        <!-- HIKVISION RTSP CAMERA SECTION -->
+
+        <section class="camera-section">
+            <div class="camera-header">
+                <h3>Hikvision Attendance Camera</h3>
+
+                <span id="cameraStatus">
+                    Stopped
+                </span>
+            </div>
+
+            <div class="camera-preview">
+                <img
+                    id="hikvisionFeed"
+                    alt="Hikvision RTSP camera feed"
+                >
+            </div>
+
+            <div class="camera-actions">
+                <button
+                    id="startCameraButton"
+                    type="button"
+                >
+                    Start Hikvision Camera
+                </button>
+
+                <button
+                    id="stopCameraButton"
+                    type="button"
+                >
+                    Stop Hikvision Camera
+                </button>
+
+                <button
+                    id="reloadCameraDataButton"
+                    type="button"
+                >
+                    Reload Embeddings
+                </button>
+            </div>
+
+            <p id="cameraMessage">
+                Camera is currently stopped.
+            </p>
+        </section>
 
         <h3>Dashboard Summary</h3>
 

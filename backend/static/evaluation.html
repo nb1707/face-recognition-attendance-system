@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Model Evaluation</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+<div class="container">
+    <h2>Face Recognition Model Evaluation</h2>
+
+    <p class="subtitle">
+        Compare face recognition accuracy, rejection behaviour,
+        identity errors and processing performance.
+    </p>
+
+    <div class="section">
+        <h3>Benchmark Controls</h3>
+
+        <label for="datasetRoot">Dataset Root:</label><br>
+
+        <input
+            id="datasetRoot"
+            type="text"
+            value="evaluation_dataset"
+        >
+
+        <br><br>
+
+        <button
+            id="runBuffaloBtn"
+            onclick="runBenchmark('buffalo_l')"
+        >
+            Run Buffalo_L
+        </button>
+
+        <button
+            id="runFaceNetBtn"
+            onclick="runBenchmark('facenet')"
+        >
+            Run FaceNet
+        </button>
+
+        <button
+            id="runAllBtn"
+            onclick="runAllBenchmarks()"
+        >
+            Run All Models
+        </button>
+
+        <button onclick="loadComparison()">
+            Refresh Comparison
+        </button>
+
+        <p id="evaluationStatus">
+            Ready.
+        </p>
+    </div>
+
+    <div class="section">
+        <h3>Latest Model Comparison</h3>
+
+        <div class="table-wrapper">
+            <table class="summary-table">
+                <thead>
+                <tr>
+                    <th>Model</th>
+                    <th>Accuracy</th>
+                    <th>Macro Precision</th>
+                    <th>Macro Recall</th>
+                    <th>Macro F1</th>
+                    <th>Known Identity Accuracy</th>
+                    <th>False Accept Rate</th>
+                    <th>False Reject Rate</th>
+                    <th>Wrong Identity Rate</th>
+                    <th>Avg Time</th>
+                    <th>Correct / Total</th>
+                    <th>Status</th>
+                </tr>
+                </thead>
+
+                <tbody id="evaluationTableBody">
+                    <tr>
+                        <td colspan="12">
+                            No evaluation results loaded.
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="section">
+        <h3>Metric Explanation</h3>
+
+        <p>
+            <strong>False Accept:</strong>
+            An unknown person is incorrectly recognized as a registered user.
+        </p>
+
+        <p>
+            <strong>False Reject:</strong>
+            A registered person is rejected as unknown, no face, or multiple faces.
+        </p>
+
+        <p>
+            <strong>Wrong Identity:</strong>
+            A registered person is recognized as a different registered person.
+        </p>
+
+        <p>
+            <strong>Known Identity Accuracy:</strong>
+            Percentage of registered-person images assigned to the correct identity.
+        </p>
+    </div>
+
+    <button onclick="window.location.href='/video-analysis-page'">
+        Back to Video Analysis
+    </button>
+</div>
+
+<script src="/static/evaluation.js"></script>
+</body>
+</html>

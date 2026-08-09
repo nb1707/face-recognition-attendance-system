@@ -284,7 +284,7 @@ async function validateUserBeforeScan() {
     const statusResult = await statusResponse.json();
 
     const isFullyRegistered =
-        statusResult.main_embedding_exists &&
+        statusResult.mean_embedding_exists &&
         statusResult.pose_embeddings.front &&
         statusResult.pose_embeddings.left &&
         statusResult.pose_embeddings.right;
