@@ -26,6 +26,7 @@ from recognition.face_preprocessing import align_detected_face
 from evaluation.benchmark import run_model_benchmark
 
 from recognition.detection_config import (CLASSROOM_ROI, TILED_DETECTION_CONFIG, DEFAULT_CLASSROOM_DETECTION_MODE)
+from recognition.thresholds import MODEL_THRESHOLDS, get_model_threshold
 
 # load environment variables from .env file
 load_dotenv()
@@ -319,29 +320,12 @@ def detect_faces_by_mode(
         )
     )
 
-MODEL_THRESHOLDS = {
-    "buffalo_l": 0.45,
-    "facenet": 0.65,
-    "adaface": 0.40,
-    "arcface_r100":0.45
-}
 SUPPORTED_BENCHMARK_MODELS = [
     "buffalo_l",
     "facenet",
     "adaface",
     "arcface_r100"
 ]
-# helper
-def get_model_threshold(model_name: str) -> float:
-    normalized_name = model_name.strip().lower()
-
-    if normalized_name not in MODEL_THRESHOLDS:
-        raise ValueError(
-            f"Recognition threshold is not configured for model: {model_name}"
-        )
-
-    return MODEL_THRESHOLDS[normalized_name]
-
 class BenchmarkRequest(BaseModel):
     model: str
     dataset_root: str = "evaluation_dataset"

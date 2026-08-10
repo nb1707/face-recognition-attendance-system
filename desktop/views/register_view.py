@@ -1,13 +1,16 @@
-"""Face-registration view skeleton."""
+"""Face-registration view with a local-camera preview."""
+
+from __future__ import annotations
 
 import tkinter as tk
+from collections.abc import Callable
 from tkinter import ttk
 
 from ..widgets import VideoPanel
 
 
 class RegisterView(ttk.Frame):
-    """Input and capture placeholders for future face registration."""
+    """Input placeholders plus a local-webcam preview."""
 
     def __init__(self, parent: tk.Misc) -> None:
         super().__init__(parent, padding=20)
@@ -19,8 +22,10 @@ class RegisterView(ttk.Frame):
         self.role = tk.StringVar(master=self, value="Student")
         self.status = tk.StringVar(
             master=self,
-            value="Ready. Registration logic is not connected in this phase.",
+            value="Camera stopped. Registration is not connected yet.",
         )
+        self._start_camera_command: Callable[[], None] | None = None
+        self._stop_camera_command: Callable[[], None] | None = None
 
         ttk.Label(
             self,
@@ -117,16 +122,31 @@ class RegisterView(ttk.Frame):
 
         actions = ttk.Frame(self)
         actions.grid(row=2, column=0, sticky="ew", pady=(14, 0))
-        actions.columnconfigure(2, weight=1)
+        actions.columnconfigure(4, weight=1)
+
+        self.start_camera_button = ttk.Button(
+            actions,
+            text="Start Camera",
+            command=self._start_camera,
+        )
+        self.start_camera_button.grid(row=0, column=0, padx=(0, 8))
+
+        self.stop_camera_button = ttk.Button(
+            actions,
+            text="Stop Camera",
+            command=self._stop_camera,
+            state="disabled",
+        )
+        self.stop_camera_button.grid(row=0, column=1, padx=(0, 8))
 
         self.capture_button = ttk.Button(
             actions,
             text="Capture",
             command=lambda: self._set_placeholder_status(
-                "Capture will be connected in the camera phase."
+                "Capture is not implemented in this preview-only phase."
             ),
         )
-        self.capture_button.grid(row=0, column=0, padx=(0, 8))
+        self.capture_button.grid(row=0, column=2, padx=(0, 8))
 
         self.register_button = ttk.Button(
             actions,
@@ -135,14 +155,14 @@ class RegisterView(ttk.Frame):
                 "Registration will be connected in a later phase."
             ),
         )
-        self.register_button.grid(row=0, column=1, padx=(0, 16))
+        self.register_button.grid(row=0, column=3, padx=(0, 16))
 
         status_area = ttk.LabelFrame(
             actions,
             text="Status / Message",
             padding=(12, 8),
         )
-        status_area.grid(row=0, column=2, sticky="ew")
+        status_area.grid(row=0, column=4, sticky="ew")
         status_area.columnconfigure(0, weight=1)
 
         ttk.Label(
@@ -155,3 +175,36 @@ class RegisterView(ttk.Frame):
     def _set_placeholder_status(self, message: str) -> None:
         self.status.set(message)
 
+    def set_camera_commands(
+        self,
+        *,
+        start_command: Callable[[], None],
+        stop_command: Callable[[], None],
+    ) -> None:
+        """Bind application-owned camera lifecycle commands."""
+        self._start_camera_command = start_command
+        self._stop_camera_command = stop_command
+
+    def set_camera_state(
+        self,
+        message: str,
+        *,
+        active: bool,
+        stopping: bool = False,
+    ) -> None:
+        """Update controls from the Tkinter main thread."""
+        self.status.set(message)
+        self.start_camera_button.configure(
+            state="disabled" if active or stopping else "normal"
+        )
+        self.stop_camera_button.configure(
+            state="normal" if active and not stopping else "disabled"
+        )
+
+    def _start_camera(self) -> None:
+        if self._start_camera_command is not None:
+            self._start_camera_command()
+
+    def _stop_camera(self) -> None:
+        if self._stop_camera_command is not None:
+            self._stop_camera_command()

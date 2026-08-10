@@ -1,8 +1,3 @@
-from recognition.buffalo_l_model import BuffaloLModel
-from recognition.facenet_model import FaceNetModel
-
-from recognition.adaface_model import AdaFaceModel
-from recognition.arcface_r100_model import ArcFaceR100Model
 _model_cache = {}
 
 
@@ -14,15 +9,23 @@ def get_model(model_name: str):
 
 
     if normalized_name == "buffalo_l":
+        from recognition.buffalo_l_model import BuffaloLModel
+
         model = BuffaloLModel()
 
     elif normalized_name == "facenet":
+        from recognition.facenet_model import FaceNetModel
+
         model = FaceNetModel()
 
     elif normalized_name == "adaface":
+        from recognition.adaface_model import AdaFaceModel
+
         model = AdaFaceModel()
 
     elif normalized_name == "arcface_r100":
+        from recognition.arcface_r100_model import ArcFaceR100Model
+
         model = ArcFaceR100Model()
     else:
         raise ValueError(

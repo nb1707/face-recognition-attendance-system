@@ -1,13 +1,14 @@
-"""Face-recognition view skeleton."""
+"""Realtime AdaFace recognition view."""
 
 import tkinter as tk
+from collections.abc import Callable
 from tkinter import ttk
 
 from ..widgets import VideoPanel
 
 
 class RecognitionView(ttk.Frame):
-    """Camera and identity placeholders for future recognition."""
+    """Hikvision preview and baseline AdaFace recognition details."""
 
     def __init__(self, parent: tk.Misc) -> None:
         super().__init__(parent, padding=20)
@@ -78,16 +79,13 @@ class RecognitionView(ttk.Frame):
         self.start_button = ttk.Button(
             details,
             text="Start Recognition",
-            command=lambda: self.status.set(
-                "Recognition startup will be implemented in a later phase."
-            ),
         )
         self.start_button.grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
         self.stop_button = ttk.Button(
             details,
             text="Stop Recognition",
-            command=lambda: self.status.set("Recognition is not running."),
+            state="disabled",
         )
         self.stop_button.grid(row=1, column=0, sticky="ew", pady=(0, 20))
 
@@ -129,3 +127,40 @@ class RecognitionView(ttk.Frame):
             justify="left",
         ).grid(row=0, column=0, sticky="w")
 
+    def set_recognition_commands(
+        self,
+        *,
+        start_command: Callable[[], None],
+        stop_command: Callable[[], None],
+    ) -> None:
+        """Bind application-owned lifecycle commands to the view."""
+        self.start_button.configure(command=start_command)
+        self.stop_button.configure(command=stop_command)
+
+    def set_camera_state(
+        self,
+        message: str,
+        *,
+        active: bool,
+        stopping: bool = False,
+    ) -> None:
+        """Update controls from Tkinter's event-loop thread."""
+        self.status.set(message)
+
+        if stopping:
+            self.start_button.configure(state="disabled")
+            self.stop_button.configure(state="disabled")
+        elif active:
+            self.start_button.configure(state="disabled")
+            self.stop_button.configure(state="normal")
+        else:
+            self.start_button.configure(state="normal")
+            self.stop_button.configure(state="disabled")
+
+    def reset_recognition_details(self) -> None:
+        self.identity.set("Identity: --")
+        self.user_id.set("User ID: --")
+        self.role.set("Role: --")
+        self.similarity.set("Similarity / Confidence: --")
+        self.recognition_status.set("Recognition Status: Idle")
+        self.processing_time.set("Processing Time: -- ms")
