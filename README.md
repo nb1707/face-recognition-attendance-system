@@ -19,6 +19,11 @@ The project investigates guided facial enrollment and roster-constrained recogni
 
 This is a research prototype, not a production-ready biometric platform. The checked-in recognition thresholds are provisional development settings rather than a production calibration.
 
+The current fail-closed Gate A margin policy requires at least two eligible
+enrolled identities in the active session roster. With fewer than two eligible
+candidates, the second-candidate margin is unavailable and Gate A does not
+confirm a match.
+
 ## Architecture and data authority
 
 The browser UI and desktop client communicate with the local FastAPI application. Enrollment metadata, samples and immutable gallery generations are stored under `backend/storage/` on the demonstration machine. Classes, roster snapshots, recognition events, recommendations, final decisions and audit history are stored in local SQLite.
@@ -27,19 +32,60 @@ SQLite is the authoritative final attendance database. Earlier Supabase-backed r
 
 Private storage, databases, face images, embeddings, evaluation datasets, recordings and model weights are deliberately excluded from Git.
 
-## Repository map
+## Repository structure
 
-| Path | Purpose |
+```text
+backend/
+├── attendance/     SQLite attendance, review and finalisation
+├── enrollment/     Guided enrollment and gallery publication
+├── recognition/    Detection, AdaFace inference, matching and confirmation
+├── analysis/       Privacy-safe experimental analysis
+├── evaluation/     Evaluation dataset and metric utilities
+├── config/         Approved synthetic demonstration configuration
+├── scripts/        Setup, replay, calibration and analysis commands
+├── sql/            Historical/reference SQL
+└── static/         Browser HTML, CSS and JavaScript served by FastAPI
+desktop/            Tkinter desktop frontend and camera/attendance workflow
+docs/               Architecture, model, experiment and defense documentation
+results/            Curated aggregate results and automated-test evidence
+tests/              Automated regression suite
+```
+
+[backend/static/](backend/static/) contains the browser frontend and is served
+directly by FastAPI; the application does not require a separate frontend build
+process. The guided enrollment interface is available at `/app`, and the class
+and roster administration interface is available at `/class-admin`.
+[desktop/](desktop/) is the separate Tkinter desktop frontend used for camera
+recognition, attendance review and finalisation.
+
+Some older web interfaces in `backend/static/` and research utilities in
+`backend/scripts/`, `backend/analysis/` and `backend/evaluation/` are
+retained for historical and dissertation evidence. They are not part of the
+authoritative final workflow described under [Demonstration workflow](#demonstration-workflow).
+
+## Examiner source navigation
+
+| Area | Verified implementation |
 |---|---|
-| `backend/main.py` | FastAPI application and route integration |
-| `backend/enrollment/` | Guided enrollment and immutable gallery publication |
-| `backend/attendance/` | SQLite schema, repository, APIs, recommendations and review |
-| `backend/recognition/` | Detection, quality, matching, tracking and Gate A/B pipeline |
-| `backend/static/` | Browser enrollment and class-administration interfaces |
-| `desktop/` | Tkinter camera, recognition and attendance application |
-| `tests/` | Automated tests using synthetic and isolated fixtures |
-| `docs/` | Architecture, model, experiment and demonstration documentation |
-| `results/` | Curated privacy-safe aggregate evidence and test reports |
+| FastAPI entry point and route integration | [`backend/main.py`](backend/main.py) |
+| Browser guided-enrollment interface | [`backend/static/index.html`](backend/static/index.html) and [`backend/static/app.js`](backend/static/app.js) |
+| Class and roster administration | [`backend/static/class_admin.html`](backend/static/class_admin.html) and [`backend/static/class_admin.js`](backend/static/class_admin.js) |
+| Tkinter entry point | [`desktop/__main__.py`](desktop/__main__.py) and [`desktop/app.py`](desktop/app.py) |
+| Face detection | [`backend/recognition/face_detector.py`](backend/recognition/face_detector.py) |
+| AdaFace inference and preprocessing | [`backend/recognition/adaface_model.py`](backend/recognition/adaface_model.py) and [`backend/recognition/adaface_preprocessing.py`](backend/recognition/adaface_preprocessing.py) |
+| Identity matching | [`backend/recognition/identity_matcher.py`](backend/recognition/identity_matcher.py) |
+| Temporal confirmation | [`backend/recognition/temporal.py`](backend/recognition/temporal.py) |
+| Enrollment gallery publication | [`backend/enrollment/gallery.py`](backend/enrollment/gallery.py) |
+| SQLite schema and repository | [`backend/attendance/database.py`](backend/attendance/database.py) and [`backend/attendance/repository.py`](backend/attendance/repository.py) |
+| Attendance review and finalisation | [`backend/attendance/service.py`](backend/attendance/service.py) |
+| Automated tests | [`tests/`](tests/) |
+| Experimental results | [`results/`](results/) |
+
+Technical starting points include
+[`docs/offline_recognition.md`](docs/offline_recognition.md),
+[`docs/local_enrollment.md`](docs/local_enrollment.md),
+[`docs/model_setup.md`](docs/model_setup.md) and
+[`docs/defense_startup_commands.md`](docs/defense_startup_commands.md).
 
 ## Supported environment
 
@@ -73,7 +119,9 @@ See [docs/model_setup.md](docs/model_setup.md) for verified identifiers, expecte
 Copy the template without replacing an existing local file:
 
 ```powershell
-Copy-Item backend\.env.example backend\.env
+if (-not (Test-Path backend\.env)) {
+    Copy-Item backend\.env.example backend\.env
+}
 ```
 
 The approved local browser workflow does not require Supabase credentials. Webcam use requires no camera credentials. Hikvision/RTSP and legacy cloud values are optional and should be supplied only on a trusted local machine. Never commit `backend/.env`.
@@ -161,10 +209,14 @@ Recognition events are evidence. A person who is not observed is not automatical
 The intended command is:
 
 ```powershell
-python -m pytest
+python -m pytest tests/
 ```
 
-Tests use temporary directories, synthetic arrays/data and mocked camera/network boundaries. Consult `results/testing/summary.md` for the latest actual execution status. A clean environment or test suite must not be described as successful unless the recorded run completed successfully.
+Tests use temporary directories, synthetic arrays/data and mocked camera/network
+boundaries. Manual diagnostic scripts outside `tests/` are not part of the
+validated automated regression suite. Consult `results/testing/summary.md` for
+the latest actual execution status. A clean environment or test suite must not
+be described as successful unless the recorded run completed successfully.
 
 ## Known limitations
 
