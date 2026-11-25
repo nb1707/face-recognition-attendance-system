@@ -1,0 +1,11 @@
+-r backend/requirements.txt
+
+# Automated testing
+pytest==9.2.0
+httpx==0.28.1
+
+# Offline analysis and report generation
+matplotlib==3.11.1
+pandas==3.0.5
+seaborn==0.13.2
+tabulate==0.10.0

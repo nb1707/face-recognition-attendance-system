@@ -1,62 +1,77 @@
 <!DOCTYPE html>
-<html>
-
+<html lang="en">
 <head>
-    <title>Face Registration</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Guided Face Enrollment</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
-    <div class="container">
-        <h2>Face Registration App</h2>
-
-        <label>User ID:</label><br>
-        <input id="userId" value="student_001"><br><br>
-
-        <label>Full Name:</label><br>
-        <input id="fullName" value="Nhan Bui"><br><br>
-
-        <label>Role:</label><br>
-        <select id="role">
-            <option value="student">Student</option>
-            <option value="teacher">Teacher</option>
-            <option value="staff">Staff</option>
-        </select><br><br>
-
-        <h3 id="instruction">Step 1: Please look straight at the camera</h3>
-        <div class="camera-wrapper">
-            <video id="video" width="420" height="320" autoplay></video>
-            <div class="face-guide"></div>
-            <div id="countdown" class="countdown-overlay"></div>
-            <div id="guideMessage" class="guide-message">
-                Align your face inside the frame
+<body class="enrollment-page">
+    <main class="enrollment-shell">
+        <header class="enrollment-header">
+            <div><p class="eyebrow">Local-first enrollment</p><h1>Guided Face Enrollment</h1>
+                <p>Capture quality-checked samples across five gentle face positions.</p></div>
+            <span id="sessionBadge" class="state-badge">No session</span>
+        </header>
+        <section class="enrollment-grid">
+            <div class="camera-column panel">
+                <div class="camera-stage" id="cameraStage">
+                    <video id="video" autoplay playsinline muted></video>
+                    <div class="face-guide" aria-hidden="true"></div>
+                    <div id="poseArrow" class="pose-arrow" aria-hidden="true">●</div>
+                    <div id="poseOverlay" class="preview-pose-overlay" hidden>
+                        <div class="preview-pose-heading">
+                            <span id="previewPoseLabel" class="pose-pill">FRONT</span>
+                            <strong id="previewPoseProgress">FRONT · 0 / 5</strong>
+                            <span id="previewCaptureStatus" class="capture-status">Start camera to capture</span>
+                        </div>
+                        <strong id="previewInstruction">Look straight at the camera</strong>
+                        <p id="previewGuidanceDetail">Keep your face centered and hold still.</p>
+                    </div>
+                    <div id="cameraPlaceholder" class="camera-placeholder">Start the camera when you are ready</div>
+                    <canvas id="canvas" hidden></canvas>
+                </div>
+                <div class="camera-controls">
+                    <button id="startCameraBtn" type="button">Start Camera</button>
+                    <button id="stopCameraBtn" type="button" class="secondary" disabled>Stop Camera</button>
+                    <button id="captureBtn" type="button" disabled>Capture Sample</button>
+                    <button id="autoBtn" type="button" class="secondary" disabled>Start Guided Scan</button>
+                    <button id="stopAutoBtn" type="button" class="danger" hidden>Stop Guided Scan</button>
+                </div>
+                <div class="pose-guidance"><span id="currentPoseLabel" class="pose-pill">FRONT</span>
+                    <div><strong id="instruction">Create an enrollment session to begin.</strong>
+                        <p id="guidanceDetail">The server will guide each pose and validate every sample.</p></div>
+                </div>
             </div>
-        </div>
-
-        <canvas id="canvas" width="420" height="320" style="display:none;"></canvas>
-
-        <br><br>
-
-        <button onclick="startCamera()">Start Camera</button>
-        <button id="captureBtn" onclick="captureAndUpload()">Capture Current Step</button>
-        <button id="autoScanBtn" onclick="startAutoScan()">Start Auto Scan</button>
-        <button onclick="resetRegistration()">Register New User</button>
-        <button onclick="window.location.href='/users-page'">View Registered Users</button>
-        <button onclick="window.location.href='/attendance-page'">Go to Attendance</button>
-        <p id="status"></p>
-
-        <h3>Registration Progress</h3>
-        <ul>
-            <li id="frontStatus">Front: ⬜ Not captured</li>
-            <li id="leftStatus">Left: ⬜ Not captured</li>
-            <li id="rightStatus">Right: ⬜ Not captured</li>
-        </ul>
-        <h3>Registered Users</h3>
-        <button onclick="loadUsers()">Refresh Users</button>
-        <ul id="usersList"></ul>
-    </div>
+            <aside class="details-column">
+                <section class="panel student-panel">
+                    <h2>Student information</h2>
+                    <label for="userId">User ID</label><input id="userId" autocomplete="off" placeholder="student_001">
+                    <label for="fullName">Full name</label><input id="fullName" autocomplete="name" placeholder="Full name">
+                    <label for="role">Role</label><select id="role"><option value="student">Student</option>
+                        <option value="teacher">Teacher</option><option value="staff">Staff</option></select>
+                    <button id="startSessionBtn" type="button">Create Enrollment Session</button>
+                </section>
+                <section class="panel progress-panel">
+                    <div class="section-heading"><h2>Capture progress</h2><span id="overallProgress">0 / 15</span></div>
+                    <div id="progressList" class="progress-list"><p class="empty-copy">Targets load from the server when a session starts.</p></div>
+                    <div class="overall-track"><span id="overallBar"></span></div>
+                </section>
+                <section id="statusBox" class="status-box info" role="status" aria-live="polite">Ready to create a local enrollment session.</section>
+                <div class="workflow-actions"><button id="reviewBtn" type="button" class="secondary" disabled>Review Samples</button>
+                    <button id="finalizeBtn" type="button" disabled>Finalize Enrollment</button>
+                    <button id="cancelSessionBtn" type="button" class="danger cancel-session" hidden disabled>Cancel Enrollment Session</button>
+                    <button id="newUserBtn" type="button" class="ghost">Register New User</button></div>
+                <div id="finalizeSteps" class="finalize-steps" hidden><span>Validating samples</span><span>Generating embeddings</span>
+                    <span>Selecting prototypes</span><span>Publishing local gallery</span></div>
+            </aside>
+        </section>
+        <section id="reviewSection" class="panel review-panel">
+            <div class="section-heading"><div><p class="eyebrow">Review</p><h2>Accepted samples</h2></div>
+                <p>Delete any sample to retake that pose before finalizing.</p></div>
+            <div id="sampleGroups" class="sample-groups"><p class="empty-copy">Accepted samples will appear here.</p></div>
+        </section>
+    </main>
     <script src="/static/app.js"></script>
-
 </body>
-
-
 </html>

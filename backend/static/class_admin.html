@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Class Administration</title>
+  <link rel="stylesheet" href="/static/class_admin.css">
+</head>
+<body>
+  <main class="page-shell">
+    <header class="page-header">
+      <div>
+        <p class="eyebrow">Local attendance database</p>
+        <h1>Class Administration</h1>
+      </div>
+      <button id="refreshButton" type="button" class="secondary">Refresh</button>
+    </header>
+
+    <p id="status" class="status" role="status" aria-live="polite"></p>
+
+    <section class="card class-picker" aria-labelledby="classesHeading">
+      <div>
+        <h2 id="classesHeading">Classes</h2>
+        <label for="classSelect">Active class</label>
+        <select id="classSelect"></select>
+      </div>
+      <dl id="selectedClass" class="class-details">
+        <div><dt>Class code</dt><dd id="selectedClassCode">—</dd></div>
+        <div><dt>Class name</dt><dd id="selectedClassName">—</dd></div>
+      </dl>
+    </section>
+
+    <div class="tables-grid">
+      <section class="card" aria-labelledby="rosterHeading">
+        <h2 id="rosterHeading">Current Roster</h2>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Student ID</th><th>Name</th><th>Role</th><th>Action</th></tr></thead>
+            <tbody id="rosterBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="availableHeading">
+        <h2 id="availableHeading">Available Students</h2>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Student ID</th><th>Name</th><th>Role</th><th>Action</th></tr></thead>
+            <tbody id="availableBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <section class="card create-class" aria-labelledby="createHeading">
+      <h2 id="createHeading">Create Class</h2>
+      <form id="createClassForm">
+        <label>Class ID<input id="newClassId" required maxlength="100"></label>
+        <label>Class code<input id="newClassCode" required maxlength="100"></label>
+        <label>Class name<input id="newClassName" required maxlength="200"></label>
+        <button type="submit">Create Class</button>
+      </form>
+    </section>
+  </main>
+  <script src="/static/class_admin.js" defer></script>
+</body>
+</html>

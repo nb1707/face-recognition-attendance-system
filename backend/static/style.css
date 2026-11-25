@@ -245,8 +245,11 @@ button:disabled {
 
 .camera-preview {
     width: 100%;
-    max-width: 1100px;
-    min-height: 480px;
+    /* max-width: 1100px; */
+    max-width: 100%;
+    height: 75vh;
+    min-height: 520px;
+    /* min-height: 480px; */
     background: #111;
     border-radius: 12px;
     overflow: hidden;
@@ -258,13 +261,144 @@ button:disabled {
 .camera-preview img {
     display: block;
     width: 100%;
-    height: auto;
+    height: 100%;
+    /* height: auto; */
+    object-fit: cover;
+    object-position: center center;
 }
 
 .camera-actions {
     display: flex;
     gap: 12px;
     margin-top: 16px;
+}
+
+/* Guided local enrollment */
+.enrollment-page {
+    margin: 0;
+    padding: 28px;
+    color: #172033;
+    text-align: left;
+    background: #eef2f7;
+}
+
+.enrollment-page * { box-sizing: border-box; }
+.enrollment-page [hidden] { display: none !important; }
+.enrollment-shell { width: min(1240px, 100%); margin: 0 auto; }
+.enrollment-header { display: flex; justify-content: space-between; gap: 24px; align-items: flex-start; margin-bottom: 22px; }
+.enrollment-header h1 { margin: 2px 0 8px; font-size: clamp(28px, 4vw, 42px); letter-spacing: -0.035em; }
+.enrollment-header p { margin: 0; color: #637083; }
+.eyebrow { margin: 0 !important; color: #2563eb !important; font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+.state-badge { padding: 9px 14px; border-radius: 999px; background: #dfe7f2; color: #40506a; font-size: 12px; font-weight: 800; letter-spacing: .04em; }
+.state-badge[data-state="CAPTURING"] { background: #dbeafe; color: #1d4ed8; }
+.state-badge[data-state="REVIEW"] { background: #fef3c7; color: #92400e; }
+.state-badge[data-state="COMPLETE"] { background: #dcfce7; color: #166534; }
+.enrollment-grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(320px, .85fr); gap: 22px; align-items: start; }
+.enrollment-page .panel { background: #fff; border: 1px solid #dde4ee; border-radius: 18px; box-shadow: 0 10px 30px rgba(24, 39, 75, .07); }
+.camera-column { padding: 18px; }
+.camera-stage { position: relative; aspect-ratio: 16 / 10; overflow: hidden; border-radius: 14px; background: #111827; }
+.camera-stage video { width: 100%; height: 100%; object-fit: cover; border: 0; border-radius: 0; transform: scaleX(-1); }
+.camera-stage .face-guide { width: 29%; height: 58%; border: 3px solid rgba(255,255,255,.86); box-shadow: 0 0 0 999px rgba(0,0,0,.18); }
+.pose-arrow { position: absolute; top: 18px; right: 18px; display: grid; place-items: center; width: 52px; height: 52px; border-radius: 50%; background: rgba(17,24,39,.72); color: white; font-size: 28px; font-weight: 800; }
+.preview-pose-overlay { display: none; }
+.camera-placeholder { position: absolute; inset: 0; display: grid; place-items: center; padding: 30px; color: #dbe4f0; text-align: center; background: radial-gradient(circle at 50% 40%, #29354a, #111827 70%); }
+.camera-controls, .workflow-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 14px; }
+.enrollment-page button, .enrollment-page input, .enrollment-page select { width: auto; margin: 0; font: inherit; }
+.enrollment-page button { min-height: 42px; padding: 10px 16px; border-radius: 10px; background: #2563eb; font-weight: 700; }
+.enrollment-page button.secondary { background: #e8eef7; color: #27364d; }
+.enrollment-page button.ghost { background: transparent; color: #41516a; border: 1px solid #ccd6e4; }
+.enrollment-page button.danger, .delete-sample { background: #fee2e2; color: #991b1b; }
+.enrollment-page button:disabled { opacity: .45; }
+.pose-guidance { display: flex; align-items: center; gap: 13px; margin-top: 15px; padding: 13px 15px; border: 1px solid #dbe6f7; border-radius: 12px; background: #f5f8fd; }
+.pose-guidance p { margin: 3px 0 0; color: #66758b; font-size: 14px; }
+.pose-pill { flex: none; padding: 8px 10px; border-radius: 8px; color: #fff; background: #2563eb; font-size: 12px; font-weight: 800; }
+.details-column { display: grid; gap: 14px; }
+.student-panel, .progress-panel { padding: 18px; }
+.student-panel h2, .progress-panel h2, .review-panel h2 { margin: 0 0 14px; font-size: 18px; }
+.student-panel label { display: block; margin: 12px 0 5px; color: #4b5b72; font-size: 13px; font-weight: 700; }
+.student-panel input, .student-panel select { width: 100%; padding: 11px 12px; border: 1px solid #cdd7e4; border-radius: 9px; background: #fff; }
+.student-panel > button { width: 100%; margin-top: 15px; }
+.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.section-heading > span { font-weight: 800; color: #2563eb; }
+.progress-list { display: grid; gap: 10px; }
+.progress-row { display: grid; grid-template-columns: 52px 1fr 34px; gap: 10px; align-items: center; font-size: 13px; }
+.progress-row strong { text-align: right; }
+.mini-track, .overall-track { height: 7px; overflow: hidden; border-radius: 99px; background: #e7ecf3; }
+.mini-track i, .overall-track span { display: block; height: 100%; border-radius: inherit; background: #2563eb; transition: width .25s ease; }
+.overall-track { height: 10px; margin-top: 15px; }
+.status-box { padding: 14px 15px; border: 1px solid; border-radius: 12px; font-size: 14px; line-height: 1.45; }
+.status-box.info { background: #eff6ff; border-color: #bfdbfe; color: #1e40af; }
+.status-box.success { background: #ecfdf5; border-color: #a7f3d0; color: #166534; }
+.status-box.warning { background: #fffbeb; border-color: #fde68a; color: #92400e; }
+.status-box.error { background: #fef2f2; border-color: #fecaca; color: #991b1b; }
+.status-box.working { background: #f5f3ff; border-color: #ddd6fe; color: #5b21b6; }
+.workflow-actions { margin: 0; }
+.workflow-actions button { flex: 1 1 145px; }
+.workflow-actions .cancel-session { flex-basis: 100%; }
+.finalize-steps { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; color: #5b21b6; font-size: 12px; }
+.finalize-steps span { padding: 8px; border-radius: 8px; background: #f5f3ff; }
+.review-panel { margin-top: 22px; padding: 20px; }
+.review-panel .section-heading > p { color: #66758b; font-size: 13px; }
+.sample-groups { display: grid; gap: 18px; }
+.sample-group h3 { margin: 0 0 9px; font-size: 15px; }
+.sample-group h3 span { color: #718096; font-weight: 500; }
+.thumbnail-row { display: grid; grid-template-columns: repeat(auto-fill, minmax(145px, 1fr)); gap: 10px; }
+.sample-card { overflow: hidden; border: 1px solid #dbe3ed; border-radius: 11px; background: #f8fafc; }
+.sample-card img { width: 100%; aspect-ratio: 1.2; display: block; object-fit: cover; }
+.sample-card > div { display: flex; justify-content: space-between; gap: 5px; padding: 8px; font-size: 12px; }
+.sample-card small { color: #66758b; }
+.sample-card button { width: 100%; min-height: 32px; padding: 6px; border-radius: 0; font-size: 12px; }
+.empty-copy { margin: 8px 0; color: #7b8798; font-size: 13px; }
+
+@media (max-width: 900px) {
+    .enrollment-page { padding: 16px; }
+    .enrollment-grid { grid-template-columns: 1fr; }
+    .details-column { grid-template-columns: 1fr 1fr; }
+    .progress-panel { order: -1; }
+    .status-box, .workflow-actions, .finalize-steps { grid-column: 1 / -1; }
+    .preview-pose-overlay { position: absolute; z-index: 3; right: 10px; bottom: 10px; left: 10px; display: block; padding: 10px 12px; border: 1px solid rgba(255,255,255,.28); border-radius: 12px; color: #fff; background: rgba(10,18,32,.82); box-shadow: 0 6px 20px rgba(0,0,0,.22); backdrop-filter: blur(5px); }
+    .preview-pose-overlay[hidden] { display: none; }
+    .preview-pose-heading { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+    .preview-pose-heading > strong { font-size: 13px; letter-spacing: .02em; }
+    .preview-pose-overlay > strong { display: block; font-size: 15px; line-height: 1.25; }
+    .preview-pose-overlay p { margin: 2px 0 0; color: #e2e8f0; font-size: 12px; line-height: 1.3; }
+    .capture-status { margin-left: auto; padding: 4px 7px; border-radius: 999px; color: #dbeafe; background: rgba(37,99,235,.5); font-size: 11px; font-weight: 700; white-space: nowrap; }
+}
+
+@media (max-width: 620px) {
+    .enrollment-page { padding: 10px; }
+    .enrollment-header { margin-bottom: 12px; }
+    .enrollment-header { display: block; }
+    .state-badge { display: inline-block; margin-top: 12px; }
+    .details-column { grid-template-columns: 1fr; }
+    .camera-column { padding: 9px; border-radius: 14px !important; }
+    .camera-stage { aspect-ratio: 4 / 3; border-radius: 11px; }
+    .camera-stage .face-guide { top: 42%; width: auto; height: min(65%, 215px); aspect-ratio: 3 / 4; border-width: 3px; box-shadow: 0 0 0 999px rgba(0,0,0,.12), 0 0 14px rgba(255,255,255,.4); }
+    .pose-arrow { top: 10px; right: 10px; width: 42px; height: 42px; font-size: 22px; }
+    .camera-controls { gap: 8px; margin-top: 9px; }
+    .camera-controls button { flex: 1 1 45%; min-height: 48px; padding: 11px 10px; }
+    .pose-guidance { margin-top: 9px; padding: 10px 11px; }
+    .student-panel, .progress-panel { padding: 14px; }
+    .details-column { gap: 10px; }
+    .preview-pose-overlay { right: 7px; bottom: 7px; left: 7px; padding: 8px 9px; }
+    .preview-pose-heading { gap: 6px; margin-bottom: 4px; }
+    .preview-pose-heading .pose-pill { padding: 6px 8px; }
+    .capture-status { font-size: 10px; }
+    .review-panel .section-heading { display: block; }
+}
+
+@media (max-width: 420px) {
+    .enrollment-header > div > p:last-child { display: none; }
+    .enrollment-header h1 { font-size: 26px; }
+    .camera-stage .face-guide { height: min(62%, 190px); }
+    .preview-pose-overlay p { font-size: 11px; }
+    .capture-status { max-width: 112px; overflow: hidden; text-overflow: ellipsis; }
+}
+
+@media (max-height: 500px) and (orientation: landscape) {
+    .camera-stage { aspect-ratio: 16 / 8; }
+    .camera-stage .face-guide { top: 42%; height: 68%; }
+    .preview-pose-overlay { max-width: 68%; }
 }
 
 #cameraStatus {

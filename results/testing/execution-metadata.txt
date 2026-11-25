@@ -1,0 +1,7 @@
+Test execution date: 11/25/2026 15:17:43
+Finished: 11/25/2026 15:18:12
+Duration: 00:00:28.4651760
+Exit code: 1
+Python: Python 3.12.4
+Test scope: tests/
+Environment: Existing project virtual environment

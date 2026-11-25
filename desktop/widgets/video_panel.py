@@ -73,6 +73,7 @@ class VideoPanel(ttk.Frame):
                     "Pillow is unavailable. The shell can run, but image "
                     "display is disabled."
                 ),
+
                 wraplength=width,
                 justify="left",
             ).grid(row=1, column=0, sticky="w", pady=(6, 0))

@@ -50,6 +50,8 @@ class DetectionResult:
     faces: tuple[DetectedFace, ...]
     processing_time_ms: float
     detection_fps: float
+    acquisition_time: float = 0.0
+    stream_id: str = ""
 
 
 class DetectionWorker:
@@ -70,6 +72,8 @@ class DetectionWorker:
 
         self._pending_frame: Any | None = None
         self._pending_frame_sequence = -1
+        self._pending_acquisition_time = 0.0
+        self._pending_stream_id = ""
         self._latest_result: DetectionResult | None = None
         self._result_revision = 0
 
@@ -146,6 +150,8 @@ class DetectionWorker:
         self,
         frame: Any,
         frame_sequence: int,
+        acquisition_time: float,
+        stream_id: str = "",
     ) -> bool:
         """Replace the pending detection input with the newest camera frame."""
         if not self._valid_frame(frame):
@@ -169,6 +175,8 @@ class DetectionWorker:
         with self._frame_lock:
             self._pending_frame = frame
             self._pending_frame_sequence = frame_sequence
+            self._pending_acquisition_time = acquisition_time
+            self._pending_stream_id = stream_id
             frame_ready_event.set()
 
         return True
@@ -257,7 +265,7 @@ class DetectionWorker:
                 if stop_event.is_set():
                     break
 
-                frame, frame_sequence = self._take_pending_frame(
+                frame, frame_sequence, acquisition_time, stream_id = self._take_pending_frame(
                     frame_ready_event
                 )
                 if frame is None:
@@ -312,6 +320,7 @@ class DetectionWorker:
                     faces=serialized_faces,
                     processing_time_ms=processing_time_ms,
                     detection_fps=detection_fps,
+                    acquisition_time=acquisition_time, stream_id=stream_id,
                 )
 
                 if result is None:
@@ -369,10 +378,12 @@ class DetectionWorker:
             TILED_DETECTION_CONFIG,
         )
         from recognition.face_detector import get_shared_detector
+        from recognition.offline_runtime import require_local_detector
 
         if not TILED_DETECTION_CONFIG.get("enabled", False):
             raise RuntimeError("Tiled face detection is disabled.")
 
+        require_local_detector()
         self._detector = get_shared_detector()
         self._classroom_roi = CLASSROOM_ROI
         self._tiled_config = TILED_DETECTION_CONFIG
@@ -383,25 +394,23 @@ class DetectionWorker:
         if self._classroom_roi is None or self._tiled_config is None:
             raise RuntimeError("Tiled detection configuration is unavailable.")
 
-        return self._detector.detect_faces_tiled(
-            image=frame,
-            roi_config=self._classroom_roi,
-            tile_count=self._tiled_config["tile_count"],
-            overlap_ratio=self._tiled_config["overlap_ratio"],
-            nms_iou_threshold=self._tiled_config["nms_iou_threshold"],
-        )
+        from recognition.detection_modes import detect_for_mode, DESKTOP_EQUIVALENT_ROI_TILED
+        return detect_for_mode(self._detector, frame, DESKTOP_EQUIVALENT_ROI_TILED,
+                               self._classroom_roi, self._tiled_config)
 
     def _take_pending_frame(
         self,
         frame_ready_event: threading.Event,
-    ) -> tuple[Any | None, int]:
+    ) -> tuple[Any | None, int, float, str]:
         with self._frame_lock:
             frame = self._pending_frame
             frame_sequence = self._pending_frame_sequence
+            acquisition_time = self._pending_acquisition_time
+            stream_id = self._pending_stream_id
             self._pending_frame = None
             self._pending_frame_sequence = -1
             frame_ready_event.clear()
-            return frame, frame_sequence
+            return frame, frame_sequence, acquisition_time, stream_id
 
     def _publish_result(
         self,
@@ -412,6 +421,8 @@ class DetectionWorker:
         faces: tuple[DetectedFace, ...],
         processing_time_ms: float,
         detection_fps: float,
+        acquisition_time: float,
+        stream_id: str,
     ) -> DetectionResult | None:
         with self._result_lock:
             if stop_event.is_set():
@@ -425,6 +436,8 @@ class DetectionWorker:
                 faces=faces,
                 processing_time_ms=processing_time_ms,
                 detection_fps=detection_fps,
+                acquisition_time=acquisition_time,
+                stream_id=stream_id,
             )
             self._latest_result = result
             return result

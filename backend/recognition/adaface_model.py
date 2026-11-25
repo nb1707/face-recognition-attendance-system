@@ -6,16 +6,16 @@ from recognition.base_model import (
     FaceRecognitionModel
 )
 from recognition.adaface_loader import (
-    load_adaface_from_local
+    load_adaface_from_local, local_model_provenance
 )
-from recognition.face_preprocessing import (
-    resize_aligned_face
-)
+from recognition.adaface_preprocessing import preprocess_bgr, EMBEDDING_DIMENSION
+from recognition.embeddings import normalized_embedding
 
 
 class AdaFaceModel(FaceRecognitionModel):
 
     def __init__(self):
+        self.provenance = local_model_provenance()
         self.device = torch.device(
             "cuda"
             if torch.cuda.is_available()
@@ -27,6 +27,8 @@ class AdaFaceModel(FaceRecognitionModel):
             .eval()
             .to(self.device)
         )
+        if local_model_provenance() != self.provenance:
+            raise RuntimeError("AdaFace checkpoint changed during loading; restart with a stable artifact")
 
     @property
     def model_name(self) -> str:
@@ -36,28 +38,8 @@ class AdaFaceModel(FaceRecognitionModel):
         self,
         aligned_face: np.ndarray
     ) -> np.ndarray:
-        face_112 = resize_aligned_face(
-            aligned_face,
-            output_size=112
-        )
-
-        # AdaFace model expects BGR input.
-        tensor = torch.from_numpy(
-            face_112
-        ).float()
-
-        tensor = tensor.permute(
-            2,
-            0,
-            1
-        )
-
-        tensor = tensor / 255.0
-        tensor = (tensor - 0.5) / 0.5
-
-        tensor = tensor.unsqueeze(0).to(
-            self.device
-        )
+        # All callers supply OpenCV BGR. RGB conversion belongs here only.
+        tensor = torch.from_numpy(preprocess_bgr(aligned_face)).to(self.device)
 
         with torch.no_grad():
             output = self.model(tensor)
@@ -75,9 +57,7 @@ class AdaFaceModel(FaceRecognitionModel):
             .astype(np.float32)
         )
 
-        return self.normalize_embedding(
-            embedding
-        )
+        return normalized_embedding(embedding.reshape(-1), EMBEDDING_DIMENSION)
 
     @staticmethod
     def _extract_feature_tensor(output):

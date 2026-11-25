@@ -1,0 +1,13 @@
+{
+  "classes": [
+    {
+      "class_id": "demo_class_001",
+      "class_code": "DEMO001",
+      "class_name": "Synthetic Demonstration Class",
+      "student_ids": [
+        "demo_student_001",
+        "demo_student_002"
+      ]
+    }
+  ]
+}

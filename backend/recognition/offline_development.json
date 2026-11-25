@@ -1,0 +1,16 @@
+{
+  "description": "PROVISIONAL DEVELOPMENT VALUES ONLY. Not calibrated or production-approved.",
+  "operating_point": {
+    "similarity_threshold": 0.4,
+    "margin_threshold": 0.05,
+    "fail_closed_when_margin_unavailable": true
+  },
+  "detection_mode": "tiled",
+  "quality": {
+    "min_size": 24,
+    "min_sharpness": 12
+  },
+  "tracker": {"min_iou": 0.3, "ttl_seconds": 2.0, "max_misses": 2, "max_tracks": 64},
+  "evidence": {"top_k": 3, "max_age_seconds": 5.0},
+  "temporal": {"min_observations": 3, "min_attempts": 3, "min_duration_seconds": 0.5, "evidence_window_seconds": 5.0}
+}

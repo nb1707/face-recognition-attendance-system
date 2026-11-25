@@ -1,4 +1,4 @@
-"""Latest-result worker for baseline single-frame AdaFace recognition."""
+"""Latest-result worker for offline AdaFace track confirmation."""
 
 from __future__ import annotations
 
@@ -7,18 +7,16 @@ import threading
 import time
 import traceback
 import logging
-from dataclasses import dataclass
+import math
+import uuid
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Literal
 
-import numpy as np
-
-from desktop.detection import DetectedFace, DetectionResult
+from desktop.detection import DetectionResult
 
 from .cache import (
     ADAFACE_MODEL_NAME,
-    CachedIdentity,
     RecognitionCache,
     RecognitionCacheError,
     load_adaface_recognition_cache,
@@ -72,6 +70,14 @@ class RecognizedFace:
     aligned_shape: tuple[int, ...] | None
     embedding_dimension: int | None
     embedding_norm: float | None
+    track_id: int | None = None
+    top2_user_id: str | None = None
+    top2_score: float | None = None
+    margin: float | None = None
+    quality_passed: bool = False
+    selected_frames: int = 0
+    valid_observations: int = 0
+    diagnostics: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +91,10 @@ class RecognitionResult:
     processing_time_ms: float
     threshold: float
     cached_identity_count: int
+    detection_processing_time_ms: float = 0.0
+    acquisition_time: float = 0.0
+    stream_id: str = ""
+    source_frame: Any = None
 
 
 class RecognitionWorker:
@@ -107,12 +117,15 @@ class RecognitionWorker:
         self._latest_result: RecognitionResult | None = None
         self._result_revision = 0
 
+        self._coordinator = None
+        self._session_id = uuid.uuid4().hex
+        self._attendance_repository = None
+        self._attendance_context = None
         self._model: Any | None = None
         self._align_detected_face: Any | None = None
         self._threshold: float | None = None
         self._cache: RecognitionCache | None = None
         self._model_class_name: str | None = None
-        self._first_face_diagnostics_reported = False
 
         self._status = RecognitionStatus(
             state="idle",
@@ -140,6 +153,11 @@ class RecognitionWorker:
         with self._state_lock:
             return self._model_class_name
 
+    @property
+    def attendance_context(self):
+        """Active roster-filtered context, or ``None`` in development mode."""
+        return self._attendance_context
+
     def latest_result(
         self,
         after_revision: int = -1,
@@ -152,12 +170,30 @@ class RecognitionWorker:
                 return None
             return self._latest_result
 
-    def start(self) -> bool:
+    def start(self, session_id: str | None = None) -> bool:
+        """Start the existing unrestricted development/test recognition path."""
+        return self._start(session_id or uuid.uuid4().hex, attendance_repository=None)
+
+    def start_attendance_session(self, session_id: str, repository=None) -> bool:
+        """Start fail-closed recognition for one authoritative attendance session."""
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            raise ValueError("An attendance session ID is required")
+        if repository is None:
+            from attendance.repository import AttendanceRepository
+            repository = AttendanceRepository()
+        return self._start(session_id, attendance_repository=repository)
+
+    def _start(self, session_id: str, *, attendance_repository) -> bool:
         """Load AdaFace/cache and start recognition in one worker thread."""
         with self._state_lock:
             if self._thread is not None and self._thread.is_alive():
                 return False
 
+            self._session_id = session_id
+            self._attendance_repository = attendance_repository
+            self._attendance_context = None
+            self._coordinator = None
             stop_event = threading.Event()
             job_ready_event = threading.Event()
             worker_thread = threading.Thread(
@@ -171,7 +207,6 @@ class RecognitionWorker:
             self._job_ready_event = job_ready_event
             self._thread = worker_thread
             self._cache = None
-            self._first_face_diagnostics_reported = False
             self._set_status_locked(
                 state="loading_model",
                 message="Loading AdaFace...",
@@ -314,20 +349,21 @@ class RecognitionWorker:
                 )
 
             startup_stage = "AdaFace threshold loading"
-            self._threshold = float(
-                self._get_model_threshold(ADAFACE_MODEL_NAME)
-            )
+            from recognition.offline_config import load_offline_config
+            self._offline_config = load_offline_config()
+            self._threshold = self._offline_config.operating_point.similarity_threshold
 
             if stop_event.is_set():
                 return
 
-            startup_stage = "Supabase AdaFace cache loading"
+            startup_stage = "local AdaFace cache loading"
             self._set_status_while_running(
                 stop_event,
                 "loading_cache",
                 "Loading registered AdaFace embeddings...",
             )
             self._cache = load_adaface_recognition_cache(
+                expected_provenance=self._model.provenance,
                 status_callback=lambda message: (
                     self._set_status_while_running(
                         stop_event,
@@ -337,6 +373,30 @@ class RecognitionWorker:
                 )
             )
 
+            if self._attendance_repository is not None:
+                startup_stage = "attendance session roster filtering"
+                from attendance.recognition_integration import (
+                    create_session_recognition_context,
+                )
+
+                self._attendance_context = create_session_recognition_context(
+                    self._attendance_repository,
+                    self._session_id,
+                    self._cache.gallery,
+                )
+                self._cache = RecognitionCache(
+                    self._attendance_context.filtered_gallery
+                )
+                if self._attendance_context.missing_gallery_student_ids:
+                    LOGGER.warning(
+                        "Attendance roster members missing from gallery; "
+                        "session_id=%s student_ids=%s",
+                        self._session_id,
+                        ",".join(
+                            self._attendance_context.missing_gallery_student_ids
+                        ),
+                    )
+
             if stop_event.is_set():
                 return
 
@@ -345,10 +405,8 @@ class RecognitionWorker:
             print(
                 "[Recognition cache] "
                 f"registered_users={self._cache.registered_user_count} "
-                "adaface_mean_records="
-                f"{self._cache.mean_embedding_record_count} "
-                "downloaded="
-                f"{self._cache.downloaded_embedding_count} "
+                "adaface_local_records="
+                f"{self._cache.prototype_record_count} "
                 f"cached_identities={identity_count} "
                 f"skipped_users={skipped_count} "
                 "skipped_embeddings="
@@ -362,7 +420,7 @@ class RecognitionWorker:
                     f"AdaFace ready. {identity_count} identities cached."
                     + (
                         f" {skipped_count} users skipped without a usable "
-                        "AdaFace mean embedding."
+                        "AdaFace prototype."
                         if skipped_count
                         else ""
                     )
@@ -471,8 +529,11 @@ class RecognitionWorker:
                     "AdaFace threshold loading": (
                         "AdaFace threshold configuration could not be loaded."
                     ),
-                    "Supabase AdaFace cache loading": (
+                    "local AdaFace cache loading": (
                         "Registered AdaFace embeddings could not be loaded."
+                    ),
+                    "attendance session roster filtering": (
+                        "Attendance session or roster gallery is unavailable."
                     ),
                 }.get(startup_stage, "Recognition startup failed.")
                 self._set_status_while_running(
@@ -502,11 +563,9 @@ class RecognitionWorker:
 
         from recognition.face_preprocessing import align_detected_face
         from recognition.model_factory import get_model
-        from recognition.thresholds import get_model_threshold
 
         self._align_detected_face = align_detected_face
         self._get_model = get_model
-        self._get_model_threshold = get_model_threshold
 
     def _recognize_detection(
         self,
@@ -520,18 +579,122 @@ class RecognitionWorker:
         started_at = time.perf_counter()
         recognized_faces: list[RecognizedFace] = []
 
-        for detected_face in detection.faces:
-            if stop_event.is_set():
-                return None
-
-            recognized_faces.append(
-                self._recognize_face(
-                    frame=detection.frame,
-                    detected_face=detected_face,
-                    identities=self._cache.identities,
-                    threshold=self._threshold,
+        from recognition.coordinator import RecognitionCoordinator
+        from recognition.offline_config import load_offline_config
+        if self._coordinator is None:
+            config = getattr(self, "_offline_config", None) or load_offline_config()
+            if self._attendance_repository is not None:
+                if self._attendance_context is None:
+                    raise RuntimeError(
+                        "Attendance recognition context was not initialized"
+                    )
+                from attendance.recognition_integration import (
+                    SQLiteAttendanceEventSink,
                 )
+                sink = SQLiteAttendanceEventSink(
+                    self._attendance_repository,
+                    self._attendance_context,
+                )
+            else:
+                from recognition.events import LocalAttendanceSink
+                event_path = Path(__file__).resolve().parents[2] / "backend/storage/offline_sessions/attendance.jsonl"
+                sink = LocalAttendanceSink(
+                    event_path,
+                    session_id=self._session_id,
+                )
+            self._coordinator = RecognitionCoordinator(self._model, self._align_detected_face,
+                self._cache.gallery, config, self._session_id, sink)
+        if stop_event.is_set():
+            return None
+        decisions = self._coordinator.process(detection.frame, detection.faces, detection.frame_sequence,
+                                             detection.acquisition_time, detection.stream_id)
+        operating_point = getattr(
+            getattr(self._coordinator, "config", None),
+            "operating_point",
+            None,
+        )
+        if decisions and operating_point is None:
+            config = (
+                getattr(self, "_offline_config", None)
+                or load_offline_config()
             )
+            operating_point = config.operating_point
+        users = {identity.user_id: identity for identity in self._cache.identities}
+        for detected, decision in zip(detection.faces, decisions):
+            candidate = users.get(decision.match.top1_user_id)
+            second_candidate = users.get(decision.match.top2_user_id)
+            match = decision.match
+            similarity_gate_passed = bool(
+                match.top1_user_id is not None
+                and match.top1_score is not None
+                and math.isfinite(match.top1_score)
+                and match.top1_score >= operating_point.similarity_threshold
+            )
+            margin_gate_passed = bool(
+                match.top2_user_id is not None
+                and match.top2_user_id != match.top1_user_id
+                and match.margin is not None
+                and math.isfinite(match.margin)
+                and match.margin >= operating_point.margin_threshold
+            )
+            matcher_diagnostics = {
+                "top1": {
+                    "user_id": match.top1_user_id,
+                    "full_name": candidate.full_name if candidate else None,
+                    "score": match.top1_score,
+                    "winning_pose": match.top1_winning_pose,
+                    "winning_prototype_id": (
+                        match.top1_winning_prototype_id
+                    ),
+                },
+                "top2": {
+                    "user_id": match.top2_user_id,
+                    "full_name": (
+                        second_candidate.full_name
+                        if second_candidate else None
+                    ),
+                    "score": match.top2_score,
+                    "winning_pose": match.top2_winning_pose,
+                    "winning_prototype_id": (
+                        match.top2_winning_prototype_id
+                    ),
+                },
+                "margin": match.margin,
+                "similarity_threshold": (
+                    operating_point.similarity_threshold
+                ),
+                "margin_threshold": operating_point.margin_threshold,
+                "similarity_gate_passed": similarity_gate_passed,
+                "margin_gate_passed": margin_gate_passed,
+                "gate_a_passed": decision.gate_a_passed,
+                "gate_a_reason": (
+                    decision.observation_reason or decision.reason
+                ),
+            }
+            serialized_diagnostics = asdict(decision)
+            serialized_diagnostics["matcher_diagnostics"] = (
+                matcher_diagnostics
+            )
+            recognized_faces.append(RecognizedFace(
+                bbox=detected.bbox, landmarks=detected.landmarks,
+                detector_confidence=detected.detector_confidence,
+                face_width=detected.face_width, face_height=detected.face_height,
+                recognized=decision.confirmed,
+                user_id=candidate.user_id if candidate and decision.confirmed else None,
+                full_name=candidate.full_name if candidate and decision.confirmed else None,
+                role=candidate.role if candidate and decision.confirmed else None,
+                best_user_id=candidate.user_id if candidate else None,
+                best_full_name=candidate.full_name if candidate else None,
+                best_role=candidate.role if candidate else None,
+                similarity=decision.match.top1_score if decision.match.top1_score is not None else -1.,
+                threshold=self._threshold, processing_time_ms=0.,
+                failure_reason=None if decision.confirmed else decision.reason,
+                aligned_shape=None, embedding_dimension=None, embedding_norm=None,
+                track_id=decision.track_id, top2_user_id=decision.match.top2_user_id,
+                top2_score=decision.match.top2_score, margin=decision.match.margin,
+                quality_passed=bool(decision.quality_decision and decision.quality_decision.passed),
+                selected_frames=decision.selected_frames, valid_observations=decision.valid_observations,
+                diagnostics=serialized_diagnostics))
 
         processing_time_ms = (time.perf_counter() - started_at) * 1000.0
 
@@ -548,186 +711,12 @@ class RecognitionWorker:
                 processing_time_ms=processing_time_ms,
                 threshold=self._threshold,
                 cached_identity_count=len(self._cache.identities),
+                detection_processing_time_ms=detection.processing_time_ms,
+                acquisition_time=detection.acquisition_time, stream_id=detection.stream_id,
+                source_frame=detection.frame,
             )
             self._latest_result = result
             return result
-
-    def _recognize_face(
-        self,
-        *,
-        frame: Any,
-        detected_face: DetectedFace,
-        identities: tuple[CachedIdentity, ...],
-        threshold: float,
-    ) -> RecognizedFace:
-        face_started_at = time.perf_counter()
-        base_data = {
-            "bbox": detected_face.bbox,
-            "landmarks": detected_face.landmarks,
-            "detector_confidence": detected_face.detector_confidence,
-            "face_width": detected_face.face_width,
-            "face_height": detected_face.face_height,
-            "threshold": threshold,
-        }
-
-        if detected_face.landmarks is None or len(detected_face.landmarks) != 5:
-            failed_face = self._failed_face(
-                base_data,
-                face_started_at,
-                "alignment_failure",
-            )
-            self._report_first_face_diagnostics(failed_face)
-            return failed_face
-
-        face_adapter = SimpleNamespace(
-            bbox=np.asarray(detected_face.bbox, dtype=np.float32),
-            kps=np.asarray(detected_face.landmarks, dtype=np.float32),
-        )
-
-        try:
-            aligned_face = self._align_detected_face(
-                image=frame,
-                detected_face=face_adapter,
-                output_size=112,
-            )
-            aligned_shape = tuple(int(value) for value in aligned_face.shape)
-        except Exception as error:
-            self._log_safe_failure("face alignment", error)
-            failed_face = self._failed_face(
-                base_data,
-                face_started_at,
-                "alignment_failure",
-            )
-            self._report_first_face_diagnostics(failed_face)
-            return failed_face
-
-        try:
-            query_embedding = self._model.extract_embedding(aligned_face)
-            query_embedding = np.asarray(
-                query_embedding,
-                dtype=np.float32,
-            ).reshape(-1)
-            embedding_norm = float(np.linalg.norm(query_embedding))
-
-            if (
-                query_embedding.size == 0
-                or not np.all(np.isfinite(query_embedding))
-                or not np.isfinite(embedding_norm)
-                or embedding_norm == 0.0
-            ):
-                raise ValueError("AdaFace returned an invalid embedding.")
-        except Exception as error:
-            self._log_safe_failure("AdaFace embedding extraction", error)
-            failed_face = self._failed_face(
-                base_data,
-                face_started_at,
-                "model_inference_error",
-            )
-            self._report_first_face_diagnostics(failed_face)
-            return failed_face
-
-        best_identity: CachedIdentity | None = None
-        best_similarity = -1.0
-        first_comparison_error: Exception | None = None
-
-        for identity in identities:
-            try:
-                similarity = float(
-                    self._model.compare(
-                        query_embedding,
-                        identity.embedding,
-                    )
-                )
-            except Exception as error:
-                if first_comparison_error is None:
-                    first_comparison_error = error
-                continue
-
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_identity = identity
-
-        if best_identity is None:
-            if first_comparison_error is not None:
-                self._log_safe_failure(
-                    "AdaFace cosine comparison",
-                    first_comparison_error,
-                )
-            failed_face = self._failed_face(
-                base_data,
-                face_started_at,
-                "no_compatible_embeddings",
-            )
-            self._report_first_face_diagnostics(failed_face)
-            return failed_face
-
-        recognized = best_similarity >= threshold
-        elapsed_ms = (time.perf_counter() - face_started_at) * 1000.0
-
-        recognized_face = RecognizedFace(
-            **base_data,
-            recognized=recognized,
-            user_id=best_identity.user_id if recognized else None,
-            full_name=best_identity.full_name if recognized else None,
-            role=best_identity.role if recognized else None,
-            best_user_id=best_identity.user_id,
-            best_full_name=best_identity.full_name,
-            best_role=best_identity.role,
-            similarity=best_similarity,
-            processing_time_ms=elapsed_ms,
-            failure_reason=None if recognized else "low_similarity",
-            aligned_shape=aligned_shape,
-            embedding_dimension=int(query_embedding.size),
-            embedding_norm=embedding_norm,
-        )
-        self._report_first_face_diagnostics(recognized_face)
-        return recognized_face
-
-    def _failed_face(
-        self,
-        base_data: dict[str, Any],
-        started_at: float,
-        reason: str,
-    ) -> RecognizedFace:
-        return RecognizedFace(
-            **base_data,
-            recognized=False,
-            user_id=None,
-            full_name=None,
-            role=None,
-            best_user_id=None,
-            best_full_name=None,
-            best_role=None,
-            similarity=-1.0,
-            processing_time_ms=(time.perf_counter() - started_at) * 1000.0,
-            failure_reason=reason,
-            aligned_shape=None,
-            embedding_dimension=None,
-            embedding_norm=None,
-        )
-
-    def _report_first_face_diagnostics(self, face: RecognizedFace) -> None:
-        if self._first_face_diagnostics_reported:
-            return
-
-        self._first_face_diagnostics_reported = True
-        decision = "Recognized" if face.recognized else "Unknown"
-        print(
-            "[Recognition face] "
-            f"bbox={face.bbox} "
-            f"landmarks={len(face.landmarks) if face.landmarks else 0} "
-            f"detector_confidence={face.detector_confidence:.4f} "
-            f"aligned_shape={face.aligned_shape} "
-            f"embedding_dimension={face.embedding_dimension} "
-            f"embedding_norm={face.embedding_norm} "
-            f"best_user_id={face.best_user_id or '--'} "
-            f"best_name={face.best_full_name or '--'} "
-            f"best_similarity={face.similarity:.4f} "
-            f"threshold={face.threshold:.2f} "
-            f"decision={decision} "
-            f"failure_reason={face.failure_reason or '--'}",
-            flush=True,
-        )
 
     def _take_pending_job(
         self,

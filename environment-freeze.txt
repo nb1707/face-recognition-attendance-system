@@ -1,0 +1,8 @@
+Python:
+Python 3.12.4
+
+Pip:
+pip 26.2.1 (Python 3.12)
+
+Note:
+Recorded from the final development environment. Machine-specific installation paths have been removed.

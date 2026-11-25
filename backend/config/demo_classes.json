@@ -1,0 +1,23 @@
+{
+  "classes": [
+    {
+      "class_id": "demo-class-a",
+      "class_code": "COMP1682-A",
+      "class_name": "COMP1682 Demo Class A",
+      "student_ids": [
+        "enroll_test_001",
+        "stu_004",
+        "stu_005",
+        "Canh"
+      ]
+    },
+    {
+      "class_id": "demo-class-b",
+      "class_code": "COMP1682-B",
+      "class_name": "COMP1682 Demo Class B",
+      "student_ids": [
+        "enroll_test_001"
+      ]
+    }
+  ]
+}

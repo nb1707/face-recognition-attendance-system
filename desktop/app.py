@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import logging
 import queue
+import time
 import tkinter as tk
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 from tkinter import ttk
 
@@ -24,12 +26,26 @@ from .detection import (
     DetectionWorker,
     draw_face_detections,
 )
+from .logging_config import configure_desktop_logging
 from .recognition import (
     RecognitionResult,
     RecognitionWorker,
     draw_recognition_results,
 )
+from .session import (
+    CAMERA_TEST_SESSION,
+    RecognitionSession,
+    RecognitionSessionInput,
+    RecognitionSessionService,
+    RecognitionTrialInput,
+    RecognitionTrialSnapshot,
+    load_recognition_configuration_snapshot,
+)
 from .views import DetectionView, HomeView, RecognitionView, RegisterView
+from .session.local_repository import LocalRecognitionSessionRepository
+from .camera.recognition_source import build_recognition_camera_source
+from .attendance import AttendanceApiClient, AttendanceClientError
+from .recognition.cache import load_adaface_recognition_cache
 
 
 LOGGER = logging.getLogger(__name__)
@@ -60,6 +76,20 @@ class FaceAttendanceDesktopApp(tk.Tk):
         self._camera_worker = CameraWorker()
         self._detection_worker = DetectionWorker()
         self._recognition_worker = RecognitionWorker()
+        self._session_service = RecognitionSessionService(repository=LocalRecognitionSessionRepository())
+        self._attendance_client = AttendanceApiClient()
+        self._attendance_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="desktop-attendance-api"
+        )
+        self._attendance_session_id: str | None = None
+        self._attendance_session: dict[str, Any] | None = None
+        self._attendance_api_pending = False
+        self._attendance_poll_pending = False
+        self._attendance_next_poll_at = 0.0
+        self._attendance_missing_gallery_reported = False
+        self._attendance_end_requested = False
+        self._attendance_executor_closed = False
+        self._shutdown_attendance_close_attempted = False
         self._camera_poll_after_id: str | None = None
         self._shutdown_after_id: str | None = None
         self._camera_owner_view: str | None = None
@@ -72,6 +102,14 @@ class FaceAttendanceDesktopApp(tk.Tk):
         self._recognition_last_result_revision = -1
         self._latest_recognition_result: RecognitionResult | None = None
         self._recognition_start_pending = False
+        self._recognition_session_create_pending = False
+        self._recognition_session_cancel_requested = False
+        self._session_camera_metadata_saved = False
+        self._session_close_requested = False
+        self._shutdown_session_close_attempts = 0
+        self._expected_users_loaded = False
+        self._expected_users_load_pending = False
+        self._visible_view_name = "home"
 
         self._views: dict[str, ttk.Frame] = {}
         self._navigation_buttons: dict[str, ttk.Button] = {}
@@ -86,6 +124,7 @@ class FaceAttendanceDesktopApp(tk.Tk):
         self.show_view("home")
         self._schedule_ui_queue_poll()
         self._schedule_camera_poll()
+        LOGGER.info("Application started")
 
     def _configure_window(self) -> None:
         self.title(self.APP_TITLE)
@@ -220,11 +259,26 @@ class FaceAttendanceDesktopApp(tk.Tk):
         if view_name not in self._views:
             raise ValueError(f"Unknown desktop view: {view_name}")
 
+        recognition_view = self._views.get("recognition")
+        if (
+            self._visible_view_name == "recognition"
+            and view_name != "recognition"
+            and isinstance(recognition_view, RecognitionView)
+            and recognition_view.attendance_phase == "active"
+        ):
+            self._end_attendance_session()
+
         if (
             self._camera_owner_view is not None
             and self._camera_owner_view != view_name
         ):
             self._stop_camera_preview()
+        elif (
+            self._visible_view_name == "recognition"
+            and view_name != "recognition"
+            and self._recognition_session_create_pending
+        ):
+            self._cancel_pending_recognition_start()
 
         self._views[view_name].tkraise()
         self._current_view_name.set(self._view_titles[view_name])
@@ -239,6 +293,60 @@ class FaceAttendanceDesktopApp(tk.Tk):
             )
 
         self._views[view_name].event_generate("<<ViewShown>>")
+        self._visible_view_name = view_name
+        if view_name == "recognition":
+            self._load_attendance_classes()
+
+    def _load_expected_users(self) -> None:
+        if (
+            self._is_shutting_down
+            or self._expected_users_loaded
+            or self._expected_users_load_pending
+        ):
+            return
+
+        recognition_view = self._views.get("recognition")
+        if not isinstance(recognition_view, RecognitionView):
+            return
+
+        self._expected_users_load_pending = True
+        if self._session_service.active_session is None:
+            recognition_view.status.set("Loading registered users...")
+        started = self._session_service.load_expected_users_async(
+            on_success=lambda users: self.post_to_ui(
+                self._on_expected_users_loaded, users
+            ),
+            on_error=lambda message: self.post_to_ui(
+                self._on_expected_users_load_failed, message
+            ),
+        )
+        if not started:
+            self._expected_users_load_pending = False
+
+    def _on_expected_users_loaded(
+        self,
+        users: tuple[tuple[str, str], ...],
+    ) -> None:
+        self._expected_users_load_pending = False
+        self._expected_users_loaded = True
+        recognition_view = self._views.get("recognition")
+        if isinstance(recognition_view, RecognitionView):
+            recognition_view.set_expected_users(users)
+            if (
+                self._session_service.active_session is None
+                and not self._recognition_session_create_pending
+            ):
+                recognition_view.status.set(
+                    f"Loaded {len(users)} registered users."
+                )
+
+    def _on_expected_users_load_failed(self, message: str) -> None:
+        self._expected_users_load_pending = False
+        recognition_view = self._views.get("recognition")
+        if isinstance(recognition_view, RecognitionView):
+            recognition_view.set_expected_users(())
+            if self._session_service.active_session is None:
+                recognition_view.status.set(message)
 
     def _bind_camera_commands(self) -> None:
         register_view = self._views["register"]
@@ -262,16 +370,24 @@ class FaceAttendanceDesktopApp(tk.Tk):
         )
         recognition_view.set_recognition_commands(
             start_command=self._start_recognition,
-            stop_command=self._stop_camera_preview,
+            stop_command=self._end_attendance_session,
+            record_trial_command=self._record_recognition_trial,
+        )
+        recognition_view.set_attendance_commands(
+            class_selected_command=self._load_selected_class_roster,
+            review_command=self._review_selected_student,
+            finalize_command=self._finalize_attendance_session,
         )
 
     def _start_registration_camera(self) -> None:
+        LOGGER.info("Local registration camera start requested")
         self._start_camera_preview(
             owner_view="register",
             source=0,
         )
 
     def _start_detection_camera(self) -> None:
+        LOGGER.info("Hikvision detection camera start requested")
         detection_view = self._views["detection"]
         if not isinstance(detection_view, DetectionView):
             return
@@ -320,57 +436,247 @@ class FaceAttendanceDesktopApp(tk.Tk):
                 active=False,
             )
             self._camera_worker.stop(wait=False)
+        else:
+            LOGGER.info("Detection worker started")
 
     def _start_recognition(self) -> None:
         recognition_view = self._views["recognition"]
         if not isinstance(recognition_view, RecognitionView):
             return
 
-        if self._recognition_worker.is_active:
-            recognition_view.set_camera_state(
-                "Recognition is already running or still stopping.",
-                active=False,
-            )
+        values = recognition_view.attendance_start_values()
+        if not values["class_id"] or not values["operator_name"]:
+            recognition_view.status.set("Select a class and enter an operator name.")
+            return
+        if self._attendance_session_id is not None or self._attendance_api_pending:
+            recognition_view.status.set("An attendance operation is already active.")
             return
 
-        recognition_view.active_model.set("Active Model: Loading AdaFace...")
-        recognition_view.recognition_status.set(
-            "Recognition Status: Loading"
-        )
-        recognition_view.set_camera_state(
-            "Camera connecting...",
-            active=True,
+        camera_key = values["camera_source"].strip().lower()
+        recognition_view.set_attendance_session("starting")
+
+        def operation() -> dict[str, Any]:
+            configuration = load_recognition_configuration_snapshot()
+            cache = load_adaface_recognition_cache()
+            session = self._attendance_client.create_session(
+                class_id=values["class_id"],
+                gallery_generation=cache.gallery.generation,
+                recognition_config=(
+                    configuration.recognition_settings
+                    or configuration.to_snapshot()
+                ),
+                camera_source=camera_key,
+                operator_name=values["operator_name"],
+            )
+            if self._is_shutting_down:
+                self._attendance_client.end_session(str(session["session_id"]))
+            return session
+
+        self._run_attendance_operation(
+            operation,
+            self._on_attendance_session_created,
+            busy_message="Creating attendance session...",
+            on_error=lambda message: recognition_view.set_attendance_session("idle"),
         )
 
-        try:
-            source = build_hikvision_rtsp_source()
-        except CameraConfigurationError as error:
-            recognition_view.set_camera_state(
-                str(error),
-                active=False,
-            )
+    def _load_attendance_classes(self) -> None:
+        recognition_view = self._views.get("recognition")
+        if not isinstance(recognition_view, RecognitionView):
+            return
+        if recognition_view.backend_available or self._attendance_api_pending:
+            return
+        self._run_attendance_operation(
+            self._attendance_client.list_classes,
+            self._on_attendance_classes_loaded,
+            busy_message="Loading attendance classes...",
+            on_error=recognition_view.set_backend_unavailable,
+        )
+
+    def _on_attendance_classes_loaded(self, classes: list[dict[str, Any]]) -> None:
+        recognition_view = self._views.get("recognition")
+        if not isinstance(recognition_view, RecognitionView):
+            return
+        recognition_view.set_classes(classes)
+        recognition_view.status.set(
+            "Select a class to view its roster."
+            if classes
+            else "No active attendance classes are available."
+        )
+
+    def _load_selected_class_roster(self) -> None:
+        recognition_view = self._views.get("recognition")
+        if not isinstance(recognition_view, RecognitionView):
+            return
+        class_id = recognition_view.selected_class_id()
+        if not class_id:
+            recognition_view.set_roster([])
+            return
+        self._run_attendance_operation(
+            lambda: self._attendance_client.get_class_roster(class_id),
+            self._on_attendance_roster_loaded,
+            busy_message="Loading class roster...",
+        )
+
+    def _on_attendance_roster_loaded(self, roster: list[dict[str, Any]]) -> None:
+        recognition_view = self._views.get("recognition")
+        if not isinstance(recognition_view, RecognitionView):
+            return
+        recognition_view.set_roster(roster)
+        recognition_view.status.set(
+            f"Roster loaded: {len(roster)} students."
+            if roster
+            else "The selected class has no active roster members."
+        )
+
+    def _on_attendance_session_created(self, session: dict[str, Any]) -> None:
+        recognition_view = self._views.get("recognition")
+        if not isinstance(recognition_view, RecognitionView):
+            return
+        self._attendance_session_id = str(session["session_id"])
+        self._attendance_session = dict(session)
+        self._attendance_next_poll_at = 0.0
+        self._attendance_missing_gallery_reported = False
+        self._attendance_end_requested = False
+        self._session_camera_metadata_saved = False
+        recognition_view.set_attendance_session("active", session)
+        if self._is_shutting_down or self._visible_view_name != "recognition":
+            self._end_attendance_session()
+            return
+        recognition_view.status.set("Session created. Camera connecting...")
+        self._start_recognition_pipeline(recognition_view)
+
+    def _run_attendance_operation(
+        self,
+        operation: Callable[[], Any],
+        on_success: Callable[[Any], None],
+        *,
+        busy_message: str,
+        on_error: Callable[[str], None] | None = None,
+    ) -> None:
+        recognition_view = self._views.get("recognition")
+        if self._attendance_api_pending:
+            if isinstance(recognition_view, RecognitionView):
+                recognition_view.status.set("Another attendance request is in progress.")
+            return
+        self._attendance_api_pending = True
+        if isinstance(recognition_view, RecognitionView):
+            recognition_view.set_attendance_busy(True, busy_message)
+        future = self._attendance_executor.submit(operation)
+
+        def completed(result_future: Future) -> None:
+            try:
+                result = result_future.result()
+            except AttendanceClientError as error:
+                message = str(error)
+                self.post_to_ui(self._complete_attendance_failure, message, on_error)
+            except Exception:
+                LOGGER.exception("Unexpected desktop attendance operation failure")
+                self.post_to_ui(
+                    self._complete_attendance_failure,
+                    "Attendance operation failed.",
+                    on_error,
+                )
+            else:
+                self.post_to_ui(self._complete_attendance_success, on_success, result)
+
+        future.add_done_callback(completed)
+
+    def _complete_attendance_success(
+        self, callback: Callable[[Any], None], result: Any
+    ) -> None:
+        self._attendance_api_pending = False
+        recognition_view = self._views.get("recognition")
+        if isinstance(recognition_view, RecognitionView):
+            recognition_view.set_attendance_busy(False)
+        callback(result)
+
+    def _complete_attendance_failure(
+        self,
+        message: str,
+        callback: Callable[[str], None] | None,
+    ) -> None:
+        self._attendance_api_pending = False
+        recognition_view = self._views.get("recognition")
+        if isinstance(recognition_view, RecognitionView):
+            recognition_view.set_attendance_busy(False)
+            recognition_view.status.set(message)
+        if callback is not None:
+            callback(message)
+
+    def _on_recognition_session_created(
+        self,
+        session: RecognitionSession,
+    ) -> None:
+        self._recognition_session_create_pending = False
+        recognition_view = self._views["recognition"]
+        if not isinstance(recognition_view, RecognitionView):
+            return
+
+        if (
+            self._is_shutting_down
+            or self._recognition_session_cancel_requested
+            or self._visible_view_name != "recognition"
+        ):
+            self._request_recognition_session_end(recognition_view)
+            return
+
+        recognition_view.set_session_active(
+            active=True,
+            session_type=session.context.session_type,
+            trial_count=0,
+        )
+        recognition_view.status.set("Session created. Camera connecting...")
+        self._start_recognition_pipeline(recognition_view)
+
+    def _on_recognition_session_create_failed(self, message: str) -> None:
+        self._recognition_session_create_pending = False
+        self._recognition_session_cancel_requested = False
+        recognition_view = self._views["recognition"]
+        if isinstance(recognition_view, RecognitionView):
+            recognition_view.set_session_pending(False)
+            recognition_view.set_camera_state(message, active=False)
             recognition_view.recognition_status.set(
                 "Recognition Status: Error"
             )
+
+    def _start_recognition_pipeline(
+        self,
+        recognition_view: RecognitionView,
+    ) -> None:
+        try:
+            source = build_recognition_camera_source(
+                recognition_view.camera_source.get()
+            )
+        except CameraConfigurationError as error:
+            recognition_view.set_camera_state(str(error), active=False)
+            recognition_view.recognition_status.set(
+                "Recognition Status: Error"
+            )
+            self._end_attendance_session_after_failure(str(error))
             return
         except Exception:
             recognition_view.set_camera_state(
-                "Hikvision camera configuration could not be loaded.",
+                "Recognition camera configuration could not be loaded.",
                 active=False,
             )
             recognition_view.recognition_status.set(
                 "Recognition Status: Error"
+            )
+            self._end_attendance_session_after_failure(
+                "Recognition camera configuration could not be loaded."
             )
             return
 
         camera_started = self._start_camera_preview(
-            owner_view="recognition",
-            source=source,
+            owner_view="recognition", source=source
         )
 
         if not camera_started:
             recognition_view.recognition_status.set(
                 "Recognition Status: Error"
+            )
+            self._end_attendance_session_after_failure(
+                "Recognition camera could not be started."
             )
             return
 
@@ -392,6 +698,279 @@ class FaceAttendanceDesktopApp(tk.Tk):
                 "Recognition Status: Error"
             )
             self._camera_worker.stop(wait=False)
+            self._end_attendance_session_after_failure(
+                self._detection_worker.status.message
+            )
+        else:
+            LOGGER.info("Detection worker started for recognition")
+
+    def _cancel_pending_recognition_start(self) -> None:
+        self._recognition_session_cancel_requested = True
+        recognition_view = self._views.get("recognition")
+        if isinstance(recognition_view, RecognitionView):
+            recognition_view.status.set("Cancelling recognition session start...")
+
+    def _end_attendance_session_after_failure(self, message: str) -> None:
+        recognition_view = self._views.get("recognition")
+        if isinstance(recognition_view, RecognitionView):
+            recognition_view.status.set(message)
+        self._end_attendance_session()
+
+    def _end_attendance_session(self) -> None:
+        recognition_view = self._views.get("recognition")
+        session_id = self._attendance_session_id
+        if not isinstance(recognition_view, RecognitionView) or session_id is None:
+            return
+        if self._attendance_api_pending:
+            recognition_view.status.set("Another attendance request is in progress.")
+            return
+        recognition_view.set_attendance_session("ending", self._attendance_session)
+        self._stop_camera_preview()
+        if not (
+            self._camera_worker.is_active
+            or self._detection_worker.is_active
+            or self._recognition_worker.is_active
+        ):
+            self._submit_attendance_end()
+
+    def _submit_attendance_end(self) -> None:
+        recognition_view = self._views.get("recognition")
+        session_id = self._attendance_session_id
+        if (
+            not isinstance(recognition_view, RecognitionView)
+            or session_id is None
+            or self._attendance_end_requested
+        ):
+            return
+        self._attendance_end_requested = True
+        self._run_attendance_operation(
+            lambda: self._attendance_client.end_session(session_id),
+            self._on_attendance_session_ended,
+            busy_message="Ending session and refreshing suggestions...",
+            on_error=self._on_attendance_end_failed,
+        )
+
+    def _on_attendance_end_failed(self, _message: str) -> None:
+        self._attendance_end_requested = False
+        recognition_view = self._views.get("recognition")
+        if isinstance(recognition_view, RecognitionView):
+            recognition_view.set_attendance_session("active", self._attendance_session)
+
+    def _on_attendance_session_ended(self, payload: dict[str, Any]) -> None:
+        recognition_view = self._views.get("recognition")
+        if not isinstance(recognition_view, RecognitionView):
+            return
+        session = dict(payload.get("session") or {})
+        records = list(payload.get("records") or [])
+        self._attendance_session = session
+        self._attendance_end_requested = True
+        recognition_view.set_attendance_session("ended", session)
+        recognition_view.set_attendance_records(records, phase="ended")
+        recognition_view.status.set(
+            "Session ended. Review every student before finalizing."
+        )
+
+    def _review_selected_student(self) -> None:
+        recognition_view = self._views.get("recognition")
+        session_id = self._attendance_session_id
+        if not isinstance(recognition_view, RecognitionView) or session_id is None:
+            return
+        values = recognition_view.selected_review_values()
+        if values is None or not values["final_status"]:
+            recognition_view.status.set("Select a student and final decision.")
+            return
+        if not values["actor"]:
+            recognition_view.status.set("Operator name is required.")
+            return
+
+        def operation() -> list[dict[str, Any]]:
+            self._attendance_client.review_student(
+                session_id,
+                values["student_id"],
+                values["final_status"],
+                values["actor"],
+                values["reason"] or None,
+            )
+            return self._attendance_client.list_records(session_id)
+
+        self._run_attendance_operation(
+            operation,
+            lambda records: self._on_attendance_review_saved(
+                values["student_id"], records
+            ),
+            busy_message=f"Saving review for {values['student_id']}...",
+        )
+
+    def _on_attendance_review_saved(
+        self, student_id: str, records: list[dict[str, Any]]
+    ) -> None:
+        recognition_view = self._views.get("recognition")
+        if isinstance(recognition_view, RecognitionView):
+            recognition_view.set_attendance_records(records, phase="ended")
+            recognition_view.status.set(f"Review saved for {student_id}.")
+
+    def _finalize_attendance_session(self) -> None:
+        recognition_view = self._views.get("recognition")
+        session_id = self._attendance_session_id
+        if not isinstance(recognition_view, RecognitionView) or session_id is None:
+            return
+        actor = recognition_view.operator_name.get().strip()
+        if not actor:
+            recognition_view.status.set("Operator name is required.")
+            return
+        self._run_attendance_operation(
+            lambda: self._attendance_client.finalize_session(session_id, actor),
+            self._on_attendance_session_finalized,
+            busy_message="Finalizing attendance session...",
+        )
+
+    def _on_attendance_session_finalized(self, session: dict[str, Any]) -> None:
+        recognition_view = self._views.get("recognition")
+        if not isinstance(recognition_view, RecognitionView):
+            return
+        self._attendance_session = dict(session)
+        recognition_view.set_attendance_session("finalized", session)
+        recognition_view.status.set("Attendance session finalized. Records are read-only.")
+
+    def _request_recognition_session_end(
+        self,
+        recognition_view: RecognitionView,
+    ) -> None:
+        if self._session_close_requested:
+            return
+        if self._session_service.active_session is None:
+            recognition_view.set_session_active(active=False)
+            recognition_view.set_session_pending(False)
+            return
+
+        self._session_close_requested = True
+        recognition_view.status.set("Ending recognition session...")
+        recognition_view.set_trial_available(False)
+        started = self._session_service.end_active_session_async(
+            on_success=lambda _ended_at: self.post_to_ui(
+                self._on_recognition_session_ended
+            ),
+            on_error=lambda message: self.post_to_ui(
+                self._on_recognition_session_end_failed, message
+            ),
+        )
+        if not started:
+            self._session_close_requested = False
+
+    def _on_recognition_session_ended(self) -> None:
+        self._session_close_requested = False
+        self._recognition_session_cancel_requested = False
+        recognition_view = self._views["recognition"]
+        if isinstance(recognition_view, RecognitionView):
+            recognition_view.set_session_active(active=False)
+            recognition_view.status.set("Recognition session ended.")
+
+    def _on_recognition_session_end_failed(self, message: str) -> None:
+        self._session_close_requested = False
+        recognition_view = self._views["recognition"]
+        if isinstance(recognition_view, RecognitionView):
+            recognition_view.status.set(message)
+
+    def _record_recognition_trial(self) -> None:
+        recognition_view = self._views["recognition"]
+        if not isinstance(recognition_view, RecognitionView):
+            return
+        session = self._session_service.active_session
+        if session is None or session.context.session_type != CAMERA_TEST_SESSION:
+            recognition_view.status.set(
+                "Record Trial is available only during an active Camera Test."
+            )
+            return
+        result = self._latest_recognition_result
+        if result is None:
+            recognition_view.status.set(
+                "No completed recognition result is available to record yet."
+            )
+            return
+
+        if not 0 <= time.monotonic() - result.acquisition_time <= 1.0:
+            recognition_view.status.set("Recognition result is stale; wait for a fresh observation.")
+            return
+        if len(result.faces) > 1:
+            recognition_view.status.set("Record Trial requires a single observed face.")
+            return
+
+        try:
+            trial = RecognitionTrialInput.from_form(
+                recognition_view.trial_form_values()
+            )
+        except ValueError as error:
+            recognition_view.status.set(str(error))
+            return
+
+        best_face = (
+            max(result.faces, key=lambda face: face.similarity)
+            if result.faces
+            else None
+        )
+        snapshot = RecognitionTrialSnapshot(
+            detected=best_face is not None,
+            detector_confidence=(
+                best_face.detector_confidence if best_face is not None else None
+            ),
+            predicted_user_id=(
+                best_face.user_id
+                if best_face is not None and best_face.recognized
+                else None
+            ),
+            predicted_name=(
+                best_face.full_name
+                if best_face is not None and best_face.recognized
+                else None
+            ),
+            similarity=(
+                best_face.similarity
+                if best_face is not None and best_face.similarity > -1.0
+                else None
+            ),
+            threshold=result.threshold,
+            recognized=bool(best_face and best_face.recognized),
+            detection_time_ms=result.detection_processing_time_ms,
+            recognition_time_ms=result.processing_time_ms,
+            diagnostics=dict(frame_sequence=result.frame_sequence, acquisition_time=result.acquisition_time,
+                             stream_id=result.stream_id, face=best_face.diagnostics if best_face else None),
+        )
+        recognition_view.set_trial_available(False)
+        recognition_view.status.set("Saving recognition test trial...")
+        started = self._session_service.record_trial_async(
+            trial,
+            snapshot,
+            on_success=lambda trial_number: self.post_to_ui(
+                self._on_recognition_trial_saved, trial_number
+            ),
+            on_error=lambda message: self.post_to_ui(
+                self._on_recognition_trial_save_failed, message
+            ),
+        )
+        if not started:
+            recognition_view.set_trial_available(True)
+            recognition_view.status.set(
+                "Another trial or session operation is still in progress."
+            )
+
+    def _on_recognition_trial_saved(self, trial_number: int) -> None:
+        recognition_view = self._views["recognition"]
+        if isinstance(recognition_view, RecognitionView):
+            recognition_view.update_trial_count(trial_number)
+            recognition_view.set_trial_available(
+                self._latest_recognition_result is not None
+            )
+            recognition_view.status.set(
+                f"Trial {trial_number} recorded successfully."
+            )
+
+    def _on_recognition_trial_save_failed(self, message: str) -> None:
+        recognition_view = self._views["recognition"]
+        if isinstance(recognition_view, RecognitionView):
+            recognition_view.set_trial_available(
+                self._latest_recognition_result is not None
+            )
+            recognition_view.status.set(message)
 
     def _start_camera_preview(
         self,
@@ -490,6 +1069,17 @@ class FaceAttendanceDesktopApp(tk.Tk):
         owner_view_name = self._camera_owner_view
 
         if owner_view_name is None:
+            recognition_view = self._views.get("recognition")
+            if self._recognition_session_create_pending:
+                self._cancel_pending_recognition_start()
+                if isinstance(recognition_view, RecognitionView):
+                    recognition_view.set_session_pending(True)
+                return
+            if (
+                self._session_service.active_session is not None
+                and isinstance(recognition_view, RecognitionView)
+            ):
+                self._request_recognition_session_end(recognition_view)
             return
 
         owner_view = self._views[owner_view_name]
@@ -497,12 +1087,14 @@ class FaceAttendanceDesktopApp(tk.Tk):
         recognition_owner = isinstance(owner_view, RecognitionView)
 
         if recognition_owner:
+            LOGGER.info("Recognition stop requested")
             self._recognition_start_pending = False
             self._recognition_worker.stop(wait=False)
             self._detection_worker.stop(wait=False)
             self._reset_recognition_state(owner_view)
             owner_view.recognition_status.set("Recognition Status: Stopping")
         elif detection_owner:
+            LOGGER.info("Detection stop requested")
             self._detection_worker.stop(wait=False)
             self._reset_detection_state(owner_view)
 
@@ -547,6 +1139,7 @@ class FaceAttendanceDesktopApp(tk.Tk):
         owner_view = self._views[owner_view_name]
 
         if isinstance(owner_view, RecognitionView):
+            LOGGER.info("Recognition workers stopped")
             self._recognition_start_pending = False
             self._recognition_worker.stop(
                 wait=True,
@@ -558,6 +1151,9 @@ class FaceAttendanceDesktopApp(tk.Tk):
             )
             self._reset_recognition_state(owner_view)
             owner_view.recognition_status.set("Recognition Status: Stopped")
+            self._request_recognition_session_end(owner_view)
+            if owner_view.attendance_phase == "ending":
+                self._submit_attendance_end()
         elif isinstance(owner_view, DetectionView):
             self._detection_worker.stop(
                 wait=True,
@@ -621,6 +1217,7 @@ class FaceAttendanceDesktopApp(tk.Tk):
 
             if status.revision != self._camera_last_status_revision:
                 self._camera_last_status_revision = status.revision
+                LOGGER.info("Camera state changed; state=%s", status.state)
                 active = status.state in {"connecting", "connected"}
                 stopping = status.state == "stopping"
                 self._set_view_camera_state(
@@ -631,6 +1228,7 @@ class FaceAttendanceDesktopApp(tk.Tk):
                 )
 
                 if status.state == "error":
+                    LOGGER.error("Camera error reported")
                     owner_view.video_panel.clear(status.message)
                     if isinstance(owner_view, RecognitionView):
                         self._recognition_start_pending = False
@@ -645,6 +1243,26 @@ class FaceAttendanceDesktopApp(tk.Tk):
                         self._detection_worker.stop(wait=False)
                         self._latest_detection_result = None
                         self._reset_detection_metrics(owner_view)
+
+                if (
+                    status.state == "connected"
+                    and isinstance(owner_view, RecognitionView)
+                    and not self._session_camera_metadata_saved
+                ):
+                    metadata = self._camera_worker.metadata
+                    if metadata is not None:
+                        resolution = (
+                            f"{metadata.width}x{metadata.height}"
+                            if metadata.width is not None
+                            and metadata.height is not None
+                            else None
+                        )
+                        self._session_camera_metadata_saved = (
+                            self._session_service.update_camera_metadata_async(
+                                camera_resolution=resolution,
+                                camera_fps=metadata.fps,
+                            )
+                        )
 
             if isinstance(owner_view, DetectionView):
                 self._poll_detection_updates(
@@ -669,6 +1287,7 @@ class FaceAttendanceDesktopApp(tk.Tk):
                     self._detection_worker.submit_frame(
                         frame=frame.image,
                         frame_sequence=frame.sequence,
+                        acquisition_time=frame.acquisition_time, stream_id=frame.stream_id,
                     )
 
                     if self._latest_detection_result is not None:
@@ -685,12 +1304,15 @@ class FaceAttendanceDesktopApp(tk.Tk):
                     self._detection_worker.submit_frame(
                         frame=frame.image,
                         frame_sequence=frame.sequence,
+                        acquisition_time=frame.acquisition_time, stream_id=frame.stream_id,
                     )
 
-                    if self._latest_recognition_result is not None:
+                    if (self._latest_recognition_result is not None
+                        and self._latest_recognition_result.stream_id == frame.stream_id
+                        and 0 <= time.monotonic() - self._latest_recognition_result.acquisition_time <= 1.0):
                         try:
                             display_frame = draw_recognition_results(
-                                frame.image,
+                                self._latest_recognition_result.source_frame,
                                 self._latest_recognition_result.faces,
                             )
                         except Exception:
@@ -698,7 +1320,9 @@ class FaceAttendanceDesktopApp(tk.Tk):
                                 "Recognition drawing error."
                             )
                             self._latest_recognition_result = None
-                    elif self._latest_detection_result is not None:
+                    elif (self._latest_detection_result is not None
+                          and self._latest_detection_result.stream_id == frame.stream_id
+                          and self._latest_detection_result.frame_sequence == frame.sequence):
                         try:
                             display_frame = draw_face_detections(
                                 frame.image,
@@ -742,7 +1366,7 @@ class FaceAttendanceDesktopApp(tk.Tk):
                 if status.state == "stopped":
                     self._finalize_camera_owner()
                 else:
-                    self._camera_owner_view = None
+                    self._finalize_camera_owner(final_message=status.message)
 
         self._schedule_camera_poll()
 
@@ -809,7 +1433,18 @@ class FaceAttendanceDesktopApp(tk.Tk):
             and detection_status.state in {"ready", "detecting"}
         ):
             self._recognition_start_pending = False
-            if self._recognition_worker.start():
+            if self._attendance_session_id is not None:
+                started = self._recognition_worker.start_attendance_session(
+                    self._attendance_session_id
+                )
+            else:
+                session = self._session_service.active_session
+                started = bool(
+                    session is not None
+                    and self._recognition_worker.start(session_id=session.session_id)
+                )
+            if started:
+                LOGGER.info("AdaFace recognition worker started")
                 recognition_view.status.set("Loading AdaFace...")
                 recognition_view.recognition_status.set(
                     "Recognition Status: Loading"
@@ -820,6 +1455,9 @@ class FaceAttendanceDesktopApp(tk.Tk):
                 )
                 recognition_view.recognition_status.set(
                     "Recognition Status: Error"
+                )
+                self._end_attendance_session_after_failure(
+                    "Attendance recognition could not be started."
                 )
         elif (
             self._recognition_start_pending
@@ -875,12 +1513,23 @@ class FaceAttendanceDesktopApp(tk.Tk):
                 recognition_view.recognition_status.set(
                     "Recognition Status: Error"
                 )
+                recognition_view.set_quality_diagnostics(None)
+                recognition_view.set_matcher_diagnostics(None)
                 self._latest_recognition_result = None
 
         if recognition_status.state == "error":
             # Keep the recognition failure visible even if a later camera
             # status revision reports that the RTSP stream is connected.
             recognition_view.status.set(recognition_status.message)
+
+        context = self._recognition_worker.attendance_context
+        if context is not None and not self._attendance_missing_gallery_reported:
+            self._attendance_missing_gallery_reported = True
+            recognition_view.set_missing_gallery_students(
+                context.missing_gallery_student_ids
+            )
+
+        self._poll_live_attendance_records(recognition_view)
 
         result = self._recognition_worker.latest_result(
             after_revision=self._recognition_last_result_revision
@@ -894,7 +1543,67 @@ class FaceAttendanceDesktopApp(tk.Tk):
         recognition_view.processing_time.set(
             f"Processing Time: {result.processing_time_ms:.2f} ms"
         )
+        recognition_view.threshold.set(f"Threshold: {result.threshold:.2f}")
+        active_session = self._session_service.active_session
+        recognition_view.set_trial_available(
+            active_session is not None
+            and active_session.context.session_type == CAMERA_TEST_SESSION
+        )
         self._update_recognition_details(recognition_view, result)
+
+    def _poll_live_attendance_records(
+        self, recognition_view: RecognitionView
+    ) -> None:
+        session_id = self._attendance_session_id
+        if (
+            session_id is None
+            or recognition_view.attendance_phase != "active"
+            or self._attendance_poll_pending
+            or self._attendance_api_pending
+            or time.monotonic() < self._attendance_next_poll_at
+        ):
+            return
+        self._attendance_poll_pending = True
+        self._attendance_next_poll_at = time.monotonic() + 1.0
+        future = self._attendance_executor.submit(
+            self._attendance_client.list_records, session_id
+        )
+
+        def completed(result_future: Future) -> None:
+            try:
+                records = result_future.result()
+            except AttendanceClientError as error:
+                self.post_to_ui(self._on_attendance_poll_failed, str(error))
+            except Exception:
+                LOGGER.exception("Live attendance record polling failed")
+                self.post_to_ui(
+                    self._on_attendance_poll_failed,
+                    "Live attendance evidence could not be refreshed.",
+                )
+            else:
+                self.post_to_ui(
+                    self._on_attendance_poll_succeeded, session_id, records
+                )
+
+        future.add_done_callback(completed)
+
+    def _on_attendance_poll_succeeded(
+        self, session_id: str, records: list[dict[str, Any]]
+    ) -> None:
+        self._attendance_poll_pending = False
+        recognition_view = self._views.get("recognition")
+        if (
+            isinstance(recognition_view, RecognitionView)
+            and session_id == self._attendance_session_id
+            and recognition_view.attendance_phase == "active"
+        ):
+            recognition_view.set_attendance_records(records, phase="active")
+
+    def _on_attendance_poll_failed(self, message: str) -> None:
+        self._attendance_poll_pending = False
+        recognition_view = self._views.get("recognition")
+        if isinstance(recognition_view, RecognitionView):
+            recognition_view.status.set(message)
 
     @staticmethod
     def _update_recognition_details(
@@ -909,6 +1618,8 @@ class FaceAttendanceDesktopApp(tk.Tk):
             recognition_view.recognition_status.set(
                 "Recognition Status: No faces"
             )
+            recognition_view.set_quality_diagnostics(None)
+            recognition_view.set_matcher_diagnostics(None)
             return
 
         best_face = max(
@@ -918,6 +1629,8 @@ class FaceAttendanceDesktopApp(tk.Tk):
         recognized_count = sum(
             1 for face in result.faces if face.recognized
         )
+        recognition_view.set_quality_diagnostics(best_face.diagnostics)
+        recognition_view.set_matcher_diagnostics(best_face.diagnostics)
 
         if best_face.recognized:
             recognition_view.identity.set(
@@ -943,7 +1656,7 @@ class FaceAttendanceDesktopApp(tk.Tk):
             }
             reason = failure_labels.get(
                 best_face.failure_reason,
-                "Unknown",
+                best_face.failure_reason or "Unknown",
             )
             recognition_view.recognition_status.set(
                 f"Recognition Status: Unknown ({reason})"
@@ -953,7 +1666,8 @@ class FaceAttendanceDesktopApp(tk.Tk):
             recognition_view.similarity.set(
                 "Similarity / Confidence: "
                 f"{best_face.similarity:.4f} "
-                f"(threshold {result.threshold:.2f})"
+                f"(T {result.threshold:.2f}, margin {best_face.margin}, "
+                f"track {best_face.track_id}, evidence {best_face.valid_observations})"
             )
         else:
             recognition_view.similarity.set(
@@ -1049,6 +1763,8 @@ class FaceAttendanceDesktopApp(tk.Tk):
             return
 
         self._is_shutting_down = True
+        self._recognition_session_cancel_requested = True
+        LOGGER.info("Application shutdown requested")
 
         # Hide the window immediately while the event loop remains alive long
         # enough for the non-daemon camera worker to release and exit.
@@ -1103,17 +1819,63 @@ class FaceAttendanceDesktopApp(tk.Tk):
             join_timeout=0.5,
         )
 
+        # Let any in-flight session insert/trial/metadata operation finish,
+        # then close the active Supabase session before destroying Tk. The
+        # event loop remains alive while these network operations run.
+        if self._session_service.is_busy:
+            self._shutdown_after_id = self.after(
+                50,
+                self._finish_shutdown_when_workers_stop,
+            )
+            return
+
+        if self._session_service.active_session is not None:
+            if self._shutdown_session_close_attempts < 3:
+                started = self._session_service.end_active_session_async()
+                if started:
+                    self._shutdown_session_close_attempts += 1
+                self._shutdown_after_id = self.after(
+                    50,
+                    self._finish_shutdown_when_workers_stop,
+                )
+                return
+            LOGGER.error(
+                "Recognition session could not be closed during shutdown "
+                "after %d attempts",
+                self._shutdown_session_close_attempts,
+            )
+
+        self._session_service.shutdown()
+
+        if not self._attendance_executor_closed:
+            self._attendance_executor.shutdown(wait=True, cancel_futures=True)
+            self._attendance_executor_closed = True
+        recognition_view = self._views.get("recognition")
+        if (
+            self._attendance_session_id is not None
+            and isinstance(recognition_view, RecognitionView)
+            and recognition_view.attendance_phase in {"active", "starting", "ending"}
+            and not self._shutdown_attendance_close_attempted
+        ):
+            self._shutdown_attendance_close_attempted = True
+            try:
+                self._attendance_client.end_session(self._attendance_session_id)
+            except AttendanceClientError as error:
+                LOGGER.error("Attendance session could not be ended on shutdown: %s", error)
+
         for handler in reversed(self._shutdown_handlers):
             try:
                 handler()
             except Exception:
                 LOGGER.exception("Desktop shutdown handler failed")
 
+        LOGGER.info("Application shutdown complete")
         self.destroy()
 
 
 def main() -> int:
     """Launch the desktop application."""
+    configure_desktop_logging()
     application = FaceAttendanceDesktopApp()
     application.mainloop()
     return 0

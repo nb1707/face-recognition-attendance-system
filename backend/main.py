@@ -1,4 +1,7 @@
-from supabase import create_client
+try:
+    from supabase import create_client
+except Exception:
+    create_client = None
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form
 import cv2
@@ -232,7 +235,14 @@ def draw_live_camera_results(
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase = None
+if create_client is not None and SUPABASE_URL and SUPABASE_KEY:
+    try:
+        # Legacy cloud endpoints remain available when configured. Local enrollment
+        # never reads this client and remains usable when configuration is absent.
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception:
+        supabase = None
 app = FastAPI()
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -240,6 +250,11 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 @app.get("/app")
 def open_app():
     return FileResponse("static/index.html")
+
+
+@app.get("/class-admin")
+def class_admin_page():
+    return FileResponse("static/class_admin.html")
 
 os.makedirs("storage/images", exist_ok=True)
 os.makedirs("storage/embeddings", exist_ok=True)
@@ -266,6 +281,22 @@ ATTENDANCE_COOLDOWN_SECONDS = 60
 # face_app.prepare(ctx_id=-1)  # CPU mode
 ACTIVE_MODEL_NAME = "buffalo_l" 
 shared_detector = get_shared_detector()
+from enrollment.api import create_enrollment_router
+from enrollment.service import EnrollmentService
+from attendance.api import create_attendance_router
+from attendance.import_enrollment_users import upsert_enrollment_student
+from attendance.repository import AttendanceRepository
+
+local_attendance_repository = AttendanceRepository()
+local_enrollment_service = EnrollmentService(
+    detector=shared_detector,
+    student_sync=lambda **identity: upsert_enrollment_student(
+        local_attendance_repository,
+        **identity,
+    ),
+)
+app.include_router(create_enrollment_router(local_enrollment_service))
+app.include_router(create_attendance_router(local_attendance_repository))
 SUPPORTED_DETECTION_MODES = {
     "full",
     "roi",

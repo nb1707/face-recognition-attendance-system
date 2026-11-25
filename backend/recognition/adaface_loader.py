@@ -5,8 +5,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from huggingface_hub import hf_hub_download
-from transformers import AutoModel
+
+
 
 
 ADAFACE_REPO_ID = (
@@ -34,6 +34,8 @@ def download_adaface_repository(
     Download all source files and weights required by
     the AdaFace custom Hugging Face model.
     """
+    from huggingface_hub import hf_hub_download
+
     ADAFACE_LOCAL_DIR.mkdir(
         parents=True,
         exist_ok=True
@@ -111,107 +113,60 @@ def _restore_modules(
             sys.modules[module_name] = module
 
 
+def local_model_provenance():
+    """Actual local checkpoint digest; never infer compatibility from dimension."""
+    import hashlib
+    from recognition.adaface_preprocessing import PREPROCESSING_VERSION, EMBEDDING_DIMENSION
+    checkpoint = ADAFACE_LOCAL_DIR / "pretrained_model" / "model.pt"
+    digest = hashlib.sha256()
+    with checkpoint.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return dict(model_name="adaface", model_revision=ADAFACE_REVISION,
+                checkpoint_sha256=digest.hexdigest(), embedding_dimension=EMBEDDING_DIMENSION,
+                preprocessing_version=PREPROCESSING_VERSION)
+
+
 def load_adaface_from_local():
-    model_directory = (
-        download_adaface_repository()
-        .resolve()
-    )
+    """Load only existing local source/weights; no HF calls, downloads or cwd edits.
 
-    internal_models_directory = (
-        model_directory / "models"
-    )
+    A private package namespace supports the artifact's relative imports without
+    replacing an application's top-level 'models' module.
+    """
+    import importlib.util
+    import threading
+    import torch
+    from omegaconf import OmegaConf
 
-    if not internal_models_directory.exists():
-        raise FileNotFoundError(
-            "AdaFace internal models folder is missing: "
-            f"{internal_models_directory}"
-        )
+    config_path = ADAFACE_LOCAL_DIR / "pretrained_model" / "model.yaml"
+    checkpoint = ADAFACE_LOCAL_DIR / "pretrained_model" / "model.pt"
+    package_path = ADAFACE_LOCAL_DIR / "models" / "__init__.py"
+    for path in (config_path, checkpoint, package_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing local AdaFace artifact: {path}")
+    config = OmegaConf.load(config_path)
+    if config.color_space != "RGB" or config.output_dim != 512 or config.name != "ir101":
+        raise ValueError("Local AdaFace artifact does not match RGB/IR101/512 contract")
+    if config.start_from:
+        raise ValueError("External AdaFace start_from checkpoints are not allowed")
+    with _LOCAL_LOAD_LOCK:
+        name = "_attendance_adaface_models"
+        package = sys.modules.get(name)
+        if package is None:
+            spec = importlib.util.spec_from_file_location(name, package_path,
+                    submodule_search_locations=[str(package_path.parent)])
+            package = importlib.util.module_from_spec(spec)
+            sys.modules[name] = package
+            try:
+                spec.loader.exec_module(package)
+            except Exception:
+                sys.modules.pop(name, None)
+                raise
+        model = package.get_model(config)
+        state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        model.load_state_dict(state, strict=True)
+        return model.eval()
 
-    models_init_file = (
-        internal_models_directory
-        / "__init__.py"
-    )
 
-    if not models_init_file.exists():
-        raise FileNotFoundError(
-            "AdaFace models/__init__.py is missing."
-        )
-
-    previous_working_directory = Path.cwd()
-    model_directory_string = str(model_directory)
-
-    removed_modules = (
-        _remove_conflicting_models_modules()
-    )
-
-    path_added = False
-
-    try:
-        # Put AdaFace repository first in Python import path.
-        if (
-            not sys.path
-            or sys.path[0] != model_directory_string
-        ):
-            sys.path.insert(
-                0,
-                model_directory_string
-            )
-            path_added = True
-
-        os.chdir(model_directory)
-
-        # Validate that Python resolves AdaFace's own package.
-        import models
-
-        models_file = getattr(
-            models,
-            "__file__",
-            None
-        )
-
-        print(
-            "AdaFace models package:",
-            models_file
-        )
-
-        if not hasattr(models, "get_model"):
-            raise ImportError(
-                "Python loaded the wrong 'models' package. "
-                f"Resolved package: {models_file}"
-            )
-
-        model = AutoModel.from_pretrained(
-            str(model_directory),
-            trust_remote_code=True,
-            local_files_only=True
-        )
-
-        return model
-
-    finally:
-        os.chdir(
-            previous_working_directory
-        )
-
-        if (
-            path_added
-            and sys.path
-            and sys.path[0]
-            == model_directory_string
-        ):
-            sys.path.pop(0)
-
-        # Remove AdaFace temporary top-level package.
-        for module_name in list(sys.modules):
-            if (
-                module_name == "models"
-                or module_name.startswith("models.")
-            ):
-                sys.modules.pop(
-                    module_name,
-                    None
-                )
-
-        _restore_modules(
-            removed_modules
-        )
+import threading
+_LOCAL_LOAD_LOCK = threading.Lock()

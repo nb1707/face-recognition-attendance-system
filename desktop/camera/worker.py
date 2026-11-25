@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import threading
+import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -37,6 +39,17 @@ class CameraFrame:
 
     sequence: int
     image: Any
+    acquisition_time: float = 0.0
+    stream_id: str = ""
+
+
+@dataclass(frozen=True)
+class CameraMetadata:
+    """Non-sensitive runtime properties reported by OpenCV."""
+
+    width: int | None
+    height: int | None
+    fps: float | None
 
 
 class CameraWorker:
@@ -59,6 +72,7 @@ class CameraWorker:
         self._stop_event: threading.Event | None = None
         self._capture: Any | None = None
         self._source_kind: Literal["webcam", "rtsp"] | None = None
+        self._metadata: CameraMetadata | None = None
 
         self._status = CameraStatus(
             state="idle",
@@ -67,6 +81,8 @@ class CameraWorker:
         )
         self._latest_frame: Any | None = None
         self._frame_sequence = 0
+        self._acquisition_time = 0.0
+        self._stream_id = uuid.uuid4().hex
 
     @property
     def status(self) -> CameraStatus:
@@ -79,6 +95,12 @@ class CameraWorker:
         """Return whether a camera thread is still alive."""
         with self._state_lock:
             return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def metadata(self) -> CameraMetadata | None:
+        """Return the connected camera properties without exposing its source."""
+        with self._state_lock:
+            return self._metadata
 
     def latest_frame(
         self,
@@ -99,6 +121,8 @@ class CameraWorker:
             return CameraFrame(
                 sequence=self._frame_sequence,
                 image=self._latest_frame,
+                acquisition_time=self._acquisition_time,
+                stream_id=self._stream_id,
             )
 
     def start(self, source: int | str) -> bool:
@@ -137,6 +161,7 @@ class CameraWorker:
             self._thread = worker_thread
             self._capture = None
             self._source_kind = source_kind
+            self._metadata = None
             self._set_status_locked(
                 state="connecting",
                 message="Camera connecting...",
@@ -170,6 +195,7 @@ class CameraWorker:
                 self._stop_event = None
                 self._capture = None
                 self._source_kind = None
+                self._metadata = None
                 self._set_status_locked(
                     state="stopped",
                     message="Camera stopped.",
@@ -209,6 +235,7 @@ class CameraWorker:
                     self._stop_event = None
                     self._capture = None
                     self._source_kind = None
+                    self._metadata = None
                 self._set_status_locked(
                     state="stopped",
                     message="Camera stopped.",
@@ -259,6 +286,11 @@ class CameraWorker:
                     )
                 return
 
+            metadata = self._read_metadata(capture)
+            with self._state_lock:
+                if not stop_event.is_set():
+                    self._metadata = metadata
+
             if not self._set_status_while_running(
                 stop_event=stop_event,
                 state="connected",
@@ -294,7 +326,10 @@ class CameraWorker:
                     stop_event.wait(self.READ_RETRY_SECONDS)
                     continue
 
+                acquisition_time = time.monotonic()
                 if consecutive_failures:
+                    with self._frame_lock:
+                        self._stream_id = uuid.uuid4().hex
                     self._set_status_while_running(
                         stop_event=stop_event,
                         state="connected",
@@ -305,6 +340,7 @@ class CameraWorker:
                 with self._frame_lock:
                     if not stop_event.is_set():
                         self._latest_frame = frame
+                        self._acquisition_time = acquisition_time
                         self._frame_sequence += 1
 
         except Exception:
@@ -323,6 +359,7 @@ class CameraWorker:
                     self._capture = None
 
                 if stop_event.is_set():
+                    self._metadata = None
                     self._set_status_locked(
                         state="stopped",
                         message="Camera stopped.",
@@ -448,6 +485,24 @@ class CameraWorker:
             return False
 
     @staticmethod
+    def _read_metadata(capture: Any) -> CameraMetadata:
+        def positive_property(property_id: int) -> float | None:
+            try:
+                value = float(capture.get(property_id))
+            except Exception:
+                return None
+            return value if value > 0 else None
+
+        width = positive_property(cv2.CAP_PROP_FRAME_WIDTH)
+        height = positive_property(cv2.CAP_PROP_FRAME_HEIGHT)
+        fps = positive_property(cv2.CAP_PROP_FPS)
+        return CameraMetadata(
+            width=int(round(width)) if width is not None else None,
+            height=int(round(height)) if height is not None else None,
+            fps=fps,
+        )
+
+    @staticmethod
     def _release_capture(capture: Any | None) -> None:
         if capture is None:
             return
@@ -466,6 +521,8 @@ class CameraWorker:
         with self._frame_lock:
             self._latest_frame = None
             self._frame_sequence = 0
+            self._acquisition_time = 0.0
+            self._stream_id = uuid.uuid4().hex
 
     def _set_status(
         self,

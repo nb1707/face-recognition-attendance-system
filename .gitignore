@@ -1,46 +1,65 @@
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python caches, test output and environments
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+.venv-release/
+venv/
+env/
+
+# Runtime databases, journals and application storage
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+storage/
+backend/storage/
+
+# Biometric and private evaluation material
+embeddings/
+**/embeddings/
+*.npy
+evaluation_dataset/
+backend/evaluation_dataset/
+
+# Downloaded models and model caches
 backend/model_weights/
 *.pth
 *.pt
 *.ckpt
 *.onnx
-.env
-.env.*
-!.env.example
-storage
-.venv/
-venv/
-env/
-__pycache__/
-*.py[cod]
-*$py.class
-*.pyc
-embeddings/
-*.npy
-evaluation_dataset/
-backend/evaluation_dataset/
+*.safetensors
+**/.cache/huggingface/
 
-storage/
-backend/storage/
-*.db
-*.sqlite
-*.sqlite3
-
-
-*.log
-logs/
-
+# Private camera recordings and local image fixtures
+*.mp4
+*.avi
+*.mov
+*.mkv
 test_classroom*.png
 anhTest.jpg
 multiFaces.jpg
 Nobita.png
 
-.pytest_cache/
-.coverage
-htmlcov/
-
+# Logs, IDE and operating-system files
+*.log
+logs/
 .vscode/
 .idea/
-
 .DS_Store
 Thumbs.db
 desktop.ini
